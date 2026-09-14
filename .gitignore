@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+record_*.wav
+_test_*.py
+*.log

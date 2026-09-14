@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗语音识别监测台</title>
+<style>
+  :root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --ok:#37d39a; --warn:#f59e0b; --txt:#e2e8f0; --dim:#94a3b8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; }
+  header h1 { font-size:17px; margin:0; }
+  .pill { font-size:12px; padding:3px 10px; border-radius:999px; background:var(--panel); border:1px solid var(--line); }
+  .pill.on { color:var(--ok); border-color:var(--ok); }
+  .pill.off { color:var(--warn); }
+  .grid { display:grid; grid-template-columns: 1fr 360px; gap:16px; padding:16px 20px; }
+  @media (max-width: 860px){ .grid { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card h2 { font-size:13px; color:var(--dim); margin:0 0 10px; font-weight:600; letter-spacing:.5px; }
+  /* VU + 状态 */
+  .vu { height:22px; background:#0b1220; border-radius:6px; overflow:hidden; }
+  .vu > i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#37d39a,#f59e0b,#ef4444); transition:width .05s linear; }
+  .row3 { display:flex; gap:10px; margin-top:12px; }
+  .stat { flex:1; text-align:center; background:#0b1220; border-radius:8px; padding:10px 6px; }
+  .stat b { display:block; font-size:18px; margin-top:4px; }
+  .stat.btn b.on { color:var(--ok); } .stat.rec b.on { color:var(--warn); }
+  .big { font-size:22px; line-height:1.5; min-height:64px; background:#0b1220; border-radius:8px; padding:12px; margin-top:12px; word-break:break-all; }
+  .big .empty { color:var(--dim); font-size:15px; }
+  canvas#wave { width:100%; height:120px; background:#0b1220; border-radius:8px; margin-top:12px; display:block; }
+  /* 历史 / 事件 */
+  #hist .item { padding:8px 10px; border-bottom:1px solid var(--line); font-size:14px; }
+  #hist .item .t { color:var(--dim); font-size:12px; margin-right:8px; }
+  #log { height:220px; overflow:auto; font-size:12.5px; color:var(--dim); }
+  #log div { padding:3px 0; border-bottom:1px dashed #1f2a3a; }
+  .hint { color:var(--dim); font-size:12px; padding:0 20px 18px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>机器狗语音识别监测台</h1>
+    <span id="conn" class="pill off">未连接</span>
+    <span id="mic" class="pill off">麦克风未连接</span>
+    <span id="asr" class="pill off">模型未加载</span>
+    <span class="pill">WS :8765 · HTTP :8080</span>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>实时电平 / 状态</h2>
+        <div class="vu"><i id="vu"></i></div>
+        <div class="row3">
+          <div class="stat btn">按钮<b id="btn" class="">—</b></div>
+          <div class="stat rec">录音中<b id="rec" class="">—</b></div>
+          <div class="stat">缓冲<b id="buf">0 ms</b></div>
+        </div>
+        <h2 style="margin-top:14px">最近一次识别原文</h2>
+        <div id="text" class="big"><span class="empty">等待语音输入…</span></div>
+        <canvas id="wave"></canvas>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>识别历史</h2>
+        <div id="hist"><div class="item"><span class="empty" style="color:var(--dim)">暂无</span></div></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h2>事件日志</h2>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+  <div class="hint">设备只在按住 GPIO9 时发送 PCM；约 300ms 无数据判定说话结束并整段识别。本阶段仅做语音识别，不含控制端转发。</div>
+
+<script>
+const WS = `ws://${location.hostname}:8765/?role=dash`;
+const $ = id => document.getElementById(id);
+const vu = $("vu"), textEl = $("text"), wave = $("wave"), wctx = wave.getContext("2d");
+
+let ws;
+function connect() {
+  ws = new WebSocket(WS);
+  ws.onopen = () => setConn(true);
+  ws.onclose = () => { setConn(false); setTimeout(connect, 2000); };
+  ws.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.type === "status") onStatus(m);
+    else if (m.type === "micstatus") $("mic").textContent = m.connected ? "麦克风已连接" : "麦克风未连接",
+                                          $("mic").className = "pill " + (m.connected ? "on" : "off");
+    else if (m.type === "asr") onAsr(m);
+    else if (m.type === "result") onResult(m);
+    else if (m.type === "event") log(m.msg);
+  };
+}
+function setConn(on){ $("conn").textContent = on ? "已连接" : "未连接"; $("conn").className = "pill " + (on?"on":"off"); }
+
+function onStatus(s) {
+  vu.style.width = Math.round((s.level||0)*100) + "%";
+  setOn($("btn"), s.button, s.button ? "按下" : "松开");
+  setOn($("rec"), s.recording, s.recording ? "是" : "否");
+  $("buf").textContent = (s.buffer_ms||0) + " ms";
+  $("mic").textContent = (s.mic === "connected") ? "麦克风已连接" : "麦克风未连接";
+  $("mic").className = "pill " + (s.mic === "connected" ? "on" : "off");
+}
+function setOn(el, on, label){
+  el.textContent = label;
+  el.className = on ? "on" : "";
+}
+
+function onResult(m) {
+  if (m.text) {
+    textEl.innerHTML = m.text;
+    addHist(m.ts, m.text, m.duration_ms, m.asr_ms);
+    drawWave(m.wave || []);
+  } else {
+    const reason = (ASR_STATUS !== "ready")
+      ? "（识别模型未加载，请查看事件日志的修复方法）"
+      : "（未识别到语音 / 静音）";
+    textEl.innerHTML = '<span class="empty">' + reason + '</span>';
+  }
+}
+
+let ASR_STATUS = "loading";
+function onAsr(m) {
+  ASR_STATUS = m.status;
+  const el = $("asr");
+  if (m.status === "ready") {
+    el.textContent = "模型就绪 · " + m.model;
+    el.className = "pill on";
+    log("ASR 模型已加载：" + m.model);
+  } else if (m.status === "unavailable") {
+    el.textContent = "模型未加载（识别空）";
+    el.className = "pill off";
+    log("⚠ ASR 模型不可用，识别将返回空。" + (m.note || ""));
+  } else {
+    el.textContent = "模型加载中…";
+    el.className = "pill off";
+  }
+}
+
+let histEmpty = true;
+function addHist(ts, txt, dur, asr) {
+  if (histEmpty) { $("hist").innerHTML = ""; histEmpty = false; }
+  const d = document.createElement("div");
+  d.className = "item";
+  d.innerHTML = `<span class="t">${ts} · ${dur}ms / ${asr}ms</span>${txt}`;
+  $("hist").prepend(d);
+}
+
+function drawWave(arr) {
+  wave.width = wave.clientWidth; wave.height = 120;
+  wctx.fillStyle = "#0b1220"; wctx.fillRect(0,0,wave.width,wave.height);
+  if (!arr.length) return;
+  wctx.strokeStyle = "#37d39a"; wctx.lineWidth = 1.5; wctx.beginPath();
+  const mid = wave.height/2;
+  for (let i=0;i<arr.length;i++){
+    const x = (i/(arr.length-1))*wave.width;
+    const y = mid - arr[i]*mid*0.92;
+    i===0 ? wctx.moveTo(x,y) : wctx.lineTo(x,y);
+  }
+  wctx.stroke();
+}
+
+function log(msg){
+  const d = document.createElement("div");
+  d.textContent = "· " + msg;
+  const box = $("log"); box.prepend(d);
+  while (box.childElementCount > 80) box.removeChild(box.lastChild);
+}
+
+connect();
+window.addEventListener("resize", () => drawWave([]));
+</script>
+</body>
+</html>
