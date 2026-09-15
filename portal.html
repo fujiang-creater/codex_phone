@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗服务台</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --card:#ffffff; --ink:#1f2733; --dim:#6b7686;
+    --line:#e3e8ef; --accent:#2563eb; --accent2:#0ea5a4;
+    --shadow:0 1px 3px rgba(16,24,40,.08),0 1px 2px rgba(16,24,40,.06);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
+  .wrap{max-width:880px;margin:0 auto;padding:40px 20px 60px;}
+  header h1{margin:0 0 6px;font-size:26px;letter-spacing:.5px;}
+  header p{margin:0;color:var(--dim);font-size:14px;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:28px;}
+  @media(max-width:640px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:22px;box-shadow:var(--shadow);text-decoration:none;color:inherit;
+    display:block;transition:transform .12s ease,box-shadow .12s ease,border-color .12s;}
+  .card:hover{transform:translateY(-3px);box-shadow:0 6px 18px rgba(16,24,40,.12);border-color:var(--accent);}
+  .card .ico{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;
+    justify-content:center;font-size:22px;margin-bottom:14px;}
+  .card.voice .ico{background:#e7f0ff;color:var(--accent);}
+  .card.ctrl .ico{background:#e3f7f5;color:var(--accent2);}
+  .card h2{margin:0 0 8px;font-size:18px;}
+  .card ul{margin:6px 0 0;padding-left:18px;color:var(--dim);font-size:13px;line-height:1.7;}
+  footer{margin-top:34px;color:var(--dim);font-size:12.5px;line-height:1.8;}
+  code{background:#eef1f6;padding:1px 6px;border-radius:5px;font-size:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>机器狗服务台</h1>
+    <p>统一入口 · 端口 <code>:8000</code> · 语音识别与设备 OTA 控制集中管理</p>
+  </header>
+
+  <div class="grid">
+    <a class="card voice" href="/voice">
+      <div class="ico">🎙️</div>
+      <h2>语音监测台</h2>
+      <ul>
+        <li>实时识别原文 / 识别历史</li>
+        <li>音频波形可视化</li>
+        <li>连接与状态事件日志</li>
+        <li>需 ASR 服务 <code>:8765</code> 在线</li>
+      </ul>
+    </a>
+
+    <a class="card ctrl" href="/ctrl">
+      <div class="ico">⚙️</div>
+      <h2>OTA 设备控制</h2>
+      <ul>
+        <li>设备列表与实时心跳</li>
+        <li>指令下发（舵机 / 动作组 / 重启 / OTA）</li>
+        <li>OTA 升级进度看板</li>
+        <li>局域网 HTTP 轮询协议 v1</li>
+      </ul>
+    </a>
+  </div>
+
+  <footer>
+    语音监测台页面由控制服务统一托管（<code>/voice</code>），不再单独占用 <code>:8080</code>。
+    若语音卡片显示“未连接”，请确认 ASR 服务 <code>:8765</code> 已启动（需装有 funasr/websockets 的运行环境）。
+  </footer>
+</div>
+</body>
+</html>

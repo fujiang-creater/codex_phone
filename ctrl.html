@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗 · 设备控制 / OTA 管理台</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --accent2: #0f9d58;
+    --warn: #d97706; --bad: #dc2626; --ok: #0f9d58; --busy: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .wrap { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 920px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, select, textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line);
+    border-radius: 7px; font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+  textarea { min-height: 70px; resize: vertical; font-family: ui-monospace, Consolas, monospace; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 120px; }
+  button { cursor: pointer; border: none; border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    font-weight: 600; color: #fff; background: var(--accent); }
+  button.ghost { background: #eef2ff; color: var(--accent); }
+  button.green { background: var(--accent2); }
+  button.warn { background: var(--warn); }
+  button.red { background: var(--bad); }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button.lite { background: #eef2ff; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .t-pending, .t-accepted, .t-executing { background: #eef2ff; color: var(--accent); }
+  .t-downloading, .t-verifying, .t-rebooting { background: #fef3c7; color: var(--warn); }
+  .t-succeeded { background: #dcfce7; color: var(--ok); }
+  .t-failed, .t-rollback { background: #fee2e2; color: var(--bad); }
+  .t-busy { background: #ede9fe; color: var(--busy); }
+  .empty { color: var(--muted); padding: 14px 4px; }
+  #log { background: #0f172a; color: #d1e0ff; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; border-radius: 8px; padding: 10px; height: 240px; overflow: auto; white-space: pre-wrap; }
+  .pill { font-size: 11px; color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>机器狗 · 设备控制 / OTA 管理台</h1>
+  <div class="sub">HTTP 局域网轮询协议 v1 · 端口 <span id="port">8000</span> · 设备主动轮询，本页用于下发指令与监控</div>
+  <div class="sub" style="margin-top:8px;"><a href="/" class="homelink">← 返回服务台主页</a></div>
+</header>
+
+<div class="wrap">
+  <!-- 左：设备列表 + 日志 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>设备状态（每 3 秒刷新）</h2>
+      <table>
+        <thead><tr><th>设备</th><th>固件</th><th>IP</th><th>RSSI</th><th>Heap</th><th>当前指令</th></tr></thead>
+        <tbody id="devbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>事件 / 响应日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- 右：指令下发 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>连接 / 鉴权</h2>
+      <div class="row">
+        <div><label>控制服务地址</label><input id="base" value="http://localhost:8000" /></div>
+        <div><label>Token（Bearer）</label><input id="token" value="dev-token-change-me" /></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><label>目标设备 ID</label><input id="device" value="esp32s3-001" /></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>下发控制指令</h2>
+      <div class="row">
+        <div>
+          <label>指令类型</label>
+          <select id="ctype">
+            <option value="servo_action">servo_action（舵机动作）</option>
+            <option value="action_group">action_group（动作组）</option>
+            <option value="stop">stop（停止）</option>
+            <option value="reboot">reboot（重启）</option>
+            <option value="ota">ota（固件升级）</option>
+          </select>
+        </div>
+      </div>
+      <div id="servoBox">
+        <label>参数 JSON（servo_action 示例）</label>
+        <textarea id="params">{"servo_id": 1, "action": "forward", "duration_ms": 1000}</textarea>
+      </div>
+      <div id="otaBox" style="display:none;">
+        <label>固件版本（需已存在于 firmware/esp32s3/&lt;version&gt;/app.bin）</label>
+        <input id="otaver" value="1.0.1" />
+        <div class="pill" style="margin-top:6px;">url / size / sha256 由服务端从固件表自动补全</div>
+      </div>
+      <div class="btnrow">
+        <button id="sendBtn">下发指令</button>
+        <button class="lite" id="refreshBtn">刷新设备</button>
+      </div>
+      <div class="btnrow">
+        <button class="ghost" data-act='{"type":"servo_action","params":{"servo_id":1,"action":"forward","duration_ms":1000}}'>前进</button>
+        <button class="ghost" data-act='{"type":"servo_action","params":{"servo_id":1,"action":"backward","duration_ms":1000}}'>后退</button>
+        <button class="ghost" data-act='{"type":"servo_action","params":{"servo_id":1,"action":"left","duration_ms":800}}'>左转</button>
+        <button class="ghost" data-act='{"type":"servo_action","params":{"servo_id":1,"action":"right","duration_ms":800}}'>右转</button>
+        <button class="warn" data-act='{"type":"stop","params":{}}'>停止</button>
+        <button class="red" data-act='{"type":"reboot","params":{}}'>重启</button>
+      </div>
+      <div class="btnrow">
+        <button class="green" id="otaBtn">下发 OTA 升级</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg, cls) => {
+  const el = $("log");
+  const t = new Date().toLocaleTimeString();
+  el.textContent += `[${t}] ${cls ? "" : ""}${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+const base = () => $("base").value.replace(/\/+$/, "");
+const headers = () => ({ "Content-Type": "application/json",
+  "Authorization": "Bearer " + $("token").value.trim() });
+
+function statusTag(s) {
+  const cls = "t-" + (s || "pending");
+  return `<span class="tag ${cls}">${s || "—"}</span>`;
+}
+
+async function api(method, path, body) {
+  const res = await fetch(base() + path, {
+    method, headers: headers(),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function refresh() {
+  const r = await api("GET", "/api/v1/devices");
+  const tb = $("devbody");
+  if (!r.ok || !r.data || !r.data.devices.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="empty">暂无设备（ESP32 心跳后即可见）</td></tr>`;
+    return;
+  }
+  tb.innerHTML = r.data.devices.map(d => {
+    const c = d.command;
+    const ctext = c ? `${statusTag(c.status)} ${c.type}` : "—";
+    const heap = d.free_heap != null ? (d.free_heap / 1000).toFixed(0) + "k" : "—";
+    const rssi = d.rssi != null ? d.rssi + "dBm" : "—";
+    return `<tr>
+      <td>${d.device_id}</td><td>${d.fw_version || "—"}</td><td>${d.ip || "—"}</td>
+      <td>${rssi}</td><td>${heap}</td><td>${ctext}</td></tr>`;
+  }).join("");
+}
+
+async function sendCommand(type, params) {
+  const did = $("device").value.trim();
+  if (!did) { log("请填写目标设备 ID", "err"); return; }
+  log(`下发 ${type} -> ${did} : ${JSON.stringify(params)}`);
+  const r = await api("POST", `/api/v1/devices/${did}/commands`, { type, params });
+  if (r.ok) {
+    log(`  成功，command_id=${r.data.command.id}（${r.data.command.status}）`, "ok");
+  } else {
+    log(`  失败 [${r.status}]: ${JSON.stringify(r.data)}`, "err");
+  }
+  refresh();
+}
+
+// 类型切换显示对应参数框
+$("ctype").addEventListener("change", (e) => {
+  const t = e.target.value;
+  $("servoBox").style.display = (t === "ota") ? "none" : "block";
+  $("otaBox").style.display = (t === "ota") ? "block" : "none";
+});
+
+$("sendBtn").addEventListener("click", () => {
+  const t = $("ctype").value;
+  if (t === "ota") { doOta(); return; }
+  let params = {};
+  try { params = JSON.parse($("params").value || "{}"); }
+  catch (e) { log("参数 JSON 解析失败：" + e.message, "err"); return; }
+  sendCommand(t, params);
+});
+
+$("otaBtn").addEventListener("click", doOta);
+function doOta() {
+  const ver = $("otaver").value.trim();
+  if (!ver) { log("请填写固件版本", "err"); return; }
+  sendCommand("ota", { version: ver });
+}
+
+document.querySelectorAll("[data-act]").forEach(b => {
+  b.addEventListener("click", () => {
+    const o = JSON.parse(b.getAttribute("data-act"));
+    sendCommand(o.type, o.params);
+  });
+});
+
+$("refreshBtn").addEventListener("click", refresh);
+
+// 初始化
+log("管理台已加载，开始轮询设备…");
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

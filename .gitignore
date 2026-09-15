@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+record_*.wav
+_test_*.py
+*.log
+
+# 运行时凭据与固件产物（devices.json 含设备明文 token，切勿提交）
+devices.json
+tokens.json
+firmware/
+*.bin
