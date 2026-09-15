@@ -32,6 +32,8 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wav", required=True, help="16k/mono/int16 说话录音 WAV")
     ap.add_argument("--url", default=URL)
+    ap.add_argument("--confirm", action="store_true",
+                   help="确认模式测试：收到 stt 后再发 {type:pc_input,action:confirm} 并等待 ack（需服务端 --pc-input-confirm）")
     a = ap.parse_args()
     pcm = load_pcm(a.wav)
     n_frames = len(pcm) // (FRAME * 2)
@@ -76,6 +78,14 @@ async def main():
                 j = json.loads(msg)
                 if j.get("type") == "stt":
                     print(f"[test] 收到 stt: {j.get('text')!r}（{time.time()-t0:.2f}s）")
+                    if a.confirm:
+                        await ws.send(json.dumps({"type": "pc_input", "action": "confirm"}))
+                        try:
+                            ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                            print(f"[test] pc_input_ack: {ack}")
+                        except asyncio.TimeoutError:
+                            print("[test] 未收到 pc_input_ack（FAIL）")
+                            sys.exit(1)
                     print("[test] === 端到端跑通 PASS ===")
                     return
                 else:

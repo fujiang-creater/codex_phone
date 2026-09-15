@@ -280,6 +280,9 @@ def downsample_wave(pcm: bytes, points: int):
 # 未开启该 flag 时完全不触发，行为与原版一致。
 # ---------------------------------------------------------------------------
 PC_INPUT = False
+PC_INPUT_CONFIRM = False        # 确认模式：识别后先缓存，等板子 confirm 才发送（防误输入）
+pending_pc_input = {}           # ws -> 待确认文本（确认模式）
+pending_lock = threading.Lock()
 
 if os.name == "nt":
     import ctypes
@@ -296,6 +299,9 @@ if os.name == "nt":
     _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
     _user32.SetClipboardData.restype = ctypes.c_void_p
     _user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    # GetClipboardData 同样返回 64 位句柄，必须声明 restype，否则 Win64 下截断成 int 触发访问违例
+    _user32.GetClipboardData.restype = ctypes.c_void_p
+    _user32.GetClipboardData.argtypes = [wintypes.UINT]
 
     _CF_UNICODETEXT = 13
     _GMEM_MOVEABLE = 0x0002
@@ -332,6 +338,26 @@ if os.name == "nt":
         finally:
             _user32.CloseClipboard()
 
+    def _win_get_clipboard_text() -> str:
+        """读取当前剪贴板文字（用于粘贴后还原）。无文字/不可读返回空。"""
+        if not _user32.OpenClipboard(None):
+            return ""
+        try:
+            h = _user32.GetClipboardData(_CF_UNICODETEXT)
+            if not h:
+                return ""
+            p = _kernel32.GlobalLock(h)
+            if not p:
+                return ""
+            try:
+                return ctypes.wstring_at(p)
+            finally:
+                _kernel32.GlobalUnlock(h)
+        except Exception:  # noqa: BLE001
+            return ""
+        finally:
+            _user32.CloseClipboard()
+
     def _win_press_ctrl_v():
         def key(vk, up=False):
             inp = _INPUT()
@@ -345,15 +371,20 @@ if os.name == "nt":
         key(_VK_CONTROL, up=True)
 
     def pc_input_inject(text: str):
-        """把识别文本粘贴到当前焦点窗口。失败只打日志，不影响识别主流程。"""
+        """把识别文本粘贴到当前焦点窗口。先备份用户原有剪贴板，粘贴后还原，
+        避免每次说话都冲掉用户复制的内容（P0 修复）。失败只打日志，不影响识别主流程。"""
         if not text:
             return
         try:
+            prev = _win_get_clipboard_text()   # ① 备份当前剪贴板文字
             if not _win_set_clipboard_text(text):
                 print("[pc-input] 剪贴板写入失败，跳过粘贴")
                 return
-            time.sleep(0.05)  # 剪贴板落盘极短缓冲
-            _win_press_ctrl_v()
+            time.sleep(0.05)                    # 剪贴板落盘极短缓冲
+            _win_press_ctrl_v()                 # ② Ctrl+V 粘贴
+            if prev:                            # ③ 还原用户原来的剪贴板
+                time.sleep(0.10)
+                _win_set_clipboard_text(prev)
             print(f"[pc-input] 已粘贴到焦点窗口：{text!r}")
         except Exception as e:  # noqa: BLE001
             print(f"[pc-input] 注入失败：{e}")
@@ -385,7 +416,17 @@ def asr_worker():
                     _send_json(ws, {"type": "stt", "text": text, "session_id": sid}), LOOP)
         print(f"[asr] 识别结果：{text if text else '(空)'}（耗时 {dt}ms）")
         if PC_INPUT and text:
-            pc_input_inject(text)  # PC 语音输入模式：粘贴到焦点窗口
+            if PC_INPUT_CONFIRM:
+                # 确认模式：先缓存，等板子发 confirm 才注入，避免识别错误直接灌进窗口
+                with pending_lock:
+                    pending_pc_input[ws] = text
+                print(f"[pc-input] 已识别，等待确认发送：{text!r}")
+                if LOOP is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        broadcast_dash({"type": "event",
+                                        "msg": f"待确认发送：{text}（板子按确认键）"}), LOOP)
+            else:
+                pc_input_inject(text)  # PC 语音输入模式：直接粘贴到焦点窗口
         payload = {
             "type": "result",
             "text": text,
@@ -548,6 +589,8 @@ async def handler(ws, path=None):
             await broadcast_mic_status()
         if is_xz or ws in xz_state:
             xz_state.pop(ws, None)
+            with pending_lock:
+                pending_pc_input.pop(ws, None)   # 清理该连接的待确认文本，避免内存泄漏
             clients["xz"].discard(ws)
             await broadcast_dash({"type": "event", "msg": "xiaozhi 采集端断开"})
             await broadcast_mic_status()
@@ -678,6 +721,32 @@ async def xz_handle_text(ws, message):
     if st is None:
         return
     t = j.get("type")
+    if t == "pc_input":
+        # 确认模式下的发送控制：confirm 才把缓存文本注入 PC 焦点窗口，cancel 丢弃。
+        # 板子端识别结果已通过 stt 显示在 LCD，用户确认无误后再按“发送键”发此指令。
+        action = j.get("action")
+        with pending_lock:
+            pend = pending_pc_input.get(ws)
+        if action == "confirm":
+            if pend:
+                # 注入会短暂占用剪贴板+模拟按键，放后台线程，不阻塞 WS 事件循环
+                threading.Thread(target=pc_input_inject, args=(pend,), daemon=True).start()
+                with pending_lock:
+                    pending_pc_input.pop(ws, None)
+                await _send_json(ws, {"type": "pc_input_ack", "action": "confirm", "ok": True})
+                print(f"[pc-input] 已确认发送：{pend!r}")
+            else:
+                await _send_json(ws, {"type": "pc_input_ack", "action": "confirm",
+                                      "ok": False, "note": "无待发送文本"})
+        elif action == "cancel":
+            with pending_lock:
+                pending_pc_input.pop(ws, None)
+            await _send_json(ws, {"type": "pc_input_ack", "action": "cancel", "ok": True})
+            print("[pc-input] 已取消发送")
+        else:
+            await _send_json(ws, {"type": "pc_input_ack", "action": action,
+                                  "ok": False, "note": "未知 action"})
+        return
     if t == "hello":
         # 关键：板子连接后先发 hello，必须回 hello（带 session_id）它才认为通道建立，
         # 否则板端会一直 Start listening failed: ESP_ERR_INVALID_STATE
@@ -836,7 +905,10 @@ if __name__ == "__main__":
                         help="关闭 Whisper VAD（强电流麦下 VAD 会把语音当噪声剪掉，导致识别为空；"
                              "此时用整段音频送识别，配合 --no-denoise 或默认降噪做 A/B）")
     parser.add_argument("--pc-input", action="store_true",
-                        help="PC 语音输入模式：识别结果写剪贴板并模拟 Ctrl+V 粘贴到当前焦点窗口光标处")
+                        help="PC 语音输入模式：识别结果写剪贴板并模拟 Ctrl+V 粘贴到当前焦点窗口光标处（松手即发）")
+    parser.add_argument("--pc-input-confirm", action="store_true",
+                        help="PC 语音输入（确认模式）：识别后先缓存不发送，等板子发 "
+                             "{\"type\":\"pc_input\",\"action\":\"confirm\"} 才粘贴到焦点窗口，避免误输入")
     a = parser.parse_args()
 
     PORT = a.port
@@ -849,10 +921,12 @@ if __name__ == "__main__":
     SAVE_WAV = a.save_wav
     DENOISE = not a.no_denoise
     VAD = not a.no_vad
-    PC_INPUT = a.pc_input
+    PC_INPUT = a.pc_input or a.pc_input_confirm
+    PC_INPUT_CONFIRM = a.pc_input_confirm
     if PC_INPUT and os.name != "nt":
-        print("[pc-input] 警告：非 Windows 平台，--pc-input 无效")
+        print("[pc-input] 警告：非 Windows 平台，--pc-input / --pc-input-confirm 无效")
         PC_INPUT = False
+        PC_INPUT_CONFIRM = False
 
     try:
         asyncio.run(main())

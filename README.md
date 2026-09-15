@@ -97,7 +97,30 @@ python servev1.py --pc-input
 ```
 
 - 实现：识别文本写入剪贴板 + 模拟 `Ctrl+V`（纯 ctypes，Windows 专用，无需装包）；
-- 注意：会覆盖剪贴板内容；不加此参数时行为与普通识别服务器完全一致。
+- 已修复覆盖剪贴板问题：粘贴后会自动还原你原来的剪贴板内容，不会冲掉复制的东西；不加此参数时行为与普通识别服务器完全一致。
+- 一键启动：双击 `servev1_pcinput.bat`（已内置 `dog_voice` 环境 python + `--pc-input`，无需手动激活 conda）。
+
+### 确认模式（--pc-input-confirm，推荐日常用）
+
+默认 `--pc-input` 是「松手即发」——识别完立刻粘贴，**没有反悔机会**。担心误输入时改用确认模式：
+
+```bash
+python servev1.py --pc-input-confirm
+```
+
+行为变化：按键说话 → 松手识别 → 文字只在**板子 LCD 显示**（回显 `stt`），**不自动粘贴**；等你看到识别正确后，按板子上的第二个「发送键」，服务端才把文字注入 PC 焦点窗口。识别错了就**别按发送键**，直接说下一句覆盖即可。
+
+- 切换开关：当前 `servev1_pcinput.bat` 默认 ` --pc-input`（松手即发）；要走确认模式时把 bat 里的 `--pc-input` 改成 `--pc-input-confirm`，或单独执行 `python servev1.py --pc-input-confirm`。
+- 发送键协议（xiaozhi 采集端，需固件配合）：板子在发送键按下时，经同一 WS 连接发一条文本帧：
+  ```json
+  {"type":"pc_input","action":"confirm"}
+  ```
+  取消（丢弃当前待发送文本）发：
+  ```json
+  {"type":"pc_input","action":"cancel"}
+  ```
+  服务端回 `{"type":"pc_input_ack","action":...,"ok":true/false}` 供固件做蜂鸣/屏显反馈。
+  **注意**：确认模式依赖板子发来的 JSON 控制帧，因此**仅 xiaozhi 链路（`?role=xiaozhi`）支持**；FJ-mic 裸 PCM 链路无控制通道，仍走松手即发。
 
 ## 协议回归测试
 
