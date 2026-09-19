@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗 · 设备控制 / OTA 管理台</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --accent2: #0f9d58;
+    --warn: #d97706; --bad: #dc2626; --ok: #0f9d58; --busy: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .wrap { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 920px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, select, textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line);
+    border-radius: 7px; font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+  textarea { min-height: 70px; resize: vertical; font-family: ui-monospace, Consolas, monospace; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 120px; }
+  button { cursor: pointer; border: none; border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    font-weight: 600; color: #fff; background: var(--accent); }
+  button.ghost { background: #eef2ff; color: var(--accent); }
+  button.green { background: var(--accent2); }
+  button.warn { background: var(--warn); }
+  button.red { background: var(--bad); }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button.lite { background: #eef2ff; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .t-pending, .t-accepted, .t-executing { background: #eef2ff; color: var(--accent); }
+  .t-downloading, .t-verifying, .t-rebooting { background: #fef3c7; color: var(--warn); }
+  .t-succeeded { background: #dcfce7; color: var(--ok); }
+  .t-failed, .t-rollback { background: #fee2e2; color: var(--bad); }
+  .t-busy { background: #ede9fe; color: var(--busy); }
+  .empty { color: var(--muted); padding: 14px 4px; }
+  #log { background: #0f172a; color: #d1e0ff; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; border-radius: 8px; padding: 10px; height: 240px; overflow: auto; white-space: pre-wrap; }
+  .pill { font-size: 11px; color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--bad); }
+  .portsel { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .portsel .pbtn { background:#eef2ff; color:var(--accent); border:1px solid #dbe3ff; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px; font-weight:600; }
+  .portsel .pbtn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .portsel .pin { width:80px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; }
+  .portsel .pgo { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:4px 12px; cursor:pointer; font-weight:600; font-size:12px; }
+  .portsel .pinfo { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>机器狗 · 设备控制 / OTA 管理台</h1>
+  <div class="sub">HTTP 双向架构 · 端口 <span id="port">8000</span> · 控制台经服务端直推 ESP32 的 <code>/api/v1/command</code>（兼容旧轮询队列）</div>
+  <div class="sub" style="margin-top:8px;"><a href="/" class="homelink">← 返回服务台主页</a></div>
+</header>
+
+<div class="wrap">
+  <!-- 左：设备列表 + 日志 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>设备总览（每 3 秒刷新）</h2>
+      <div class="pill" style="margin-bottom:8px;">显示“—”表示该字段板子从未上报：板端需在 <code>hello</code> 或 <code>{"type":"state"}</code> 里带上 <code>fw_version / rssi / free_heap / uptime_sec</code>，服务端才会记录。</div>
+      <table>
+        <thead><tr><th>设备</th><th>连接</th><th>来源</th><th>固件</th><th>IP</th><th>RSSI</th><th>Heap</th><th>当前动作</th><th>上报年龄</th></tr></thead>
+        <tbody id="devbody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>事件 / 响应日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- 右：指令下发 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>连接 / 鉴权</h2>
+      <div class="row">
+        <div>
+          <label>控制服务端口（调试时可切换）</label>
+          <div class="portsel">
+            <button class="pbtn" data-port="8000">8000</button>
+            <button class="pbtn" data-port="8001">8001</button>
+            <input id="portInput" class="pin" type="number" min="1" max="65535" placeholder="其他" />
+            <button id="portGo" class="pgo">应用</button>
+            <span id="portState" class="pinfo">页面加载后自动识别</span>
+          </div>
+          <input id="base" value="" style="margin-top:6px;" />
+        </div>
+        <div><label>Token（Bearer）</label><input id="token" value="dev-token-change-me" /></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><label>目标设备 ID</label><input id="device" value="esp32s3-001" /></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>设备端点（指令直推目标）</h2>
+      <div class="pill" style="margin-bottom:8px;">新版架构：控制台经服务端直推 ESP32 自己的 <code>/api/v1/command</code>。此处登记每块板的 IP:端口:Token；ESP32 连音频 WS 时也会自动按源 IP 注册。</div>
+      <div class="row">
+        <div><label>设备 ID</label><input id="epId" placeholder="esp32s3-001" /></div>
+        <div><label>ESP32 IP</label><input id="epHost" placeholder="192.168.1.50" /></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><label>HTTP 端口（ESP32）</label><input id="epPort" value="80" /></div>
+        <div><label>Token（Bearer，可空）</label><input id="epToken" placeholder="esp32s3-device-token" /></div>
+      </div>
+      <div class="btnrow">
+        <button id="epSave">登记 / 更新端点</button>
+        <button class="lite" id="epRefresh">刷新端点列表</button>
+      </div>
+      <table style="margin-top:10px;">
+        <thead><tr><th>设备</th><th>主机:端口</th><th>来源</th><th>操作</th></tr></thead>
+        <tbody id="epBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>设备状态（调度中枢，每 2 秒刷新）</h2>
+      <table>
+        <thead><tr><th>设备</th><th>状态</th><th>WS</th><th>当前动作</th><th>播放队列</th><th>上报年龄</th><th>OTA</th></tr></thead>
+        <tbody id="stBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>调度控制台（指令统一走 WebSocket）</h2>
+      <div class="row">
+        <div>
+          <label>舵机 / 动作（数字越小优先级越高，P0/P1 抢占并打断播放）</label>
+          <div class="btnrow">
+            <button class="red" data-cmd="motion.emergency_stop" data-args='{}' data-prio="0">急停 P0</button>
+            <button class="warn" data-cmd="action.stop" data-args='{}' data-prio="1">停止 P1</button>
+            <button class="ghost" data-cmd="servo.move" data-args='{"servos":[{"id":1,"pos":1500,"time":300}]}' data-prio="2">调试单步 P2</button>
+            <button class="ghost" data-cmd="action.run" data-args='{"group":"forward","times":1}' data-prio="3">动作组 P3</button>
+          </div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div>
+          <label>表情 display.face（持续 5s 后自动切回状态显示）</label>
+          <div class="btnrow">
+            <button class="ghost" data-face="happy">happy</button>
+            <button class="ghost" data-face="angry">angry</button>
+            <button class="ghost" data-face="sad">sad</button>
+            <button class="ghost" data-face="joy">joy</button>
+          </div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div>
+          <label>语音下行播放（TTS 未接入时发提示音占位）</label>
+          <input id="playText" value="你好，我是机器狗" />
+        </div>
+      </div>
+      <div class="btnrow">
+        <button class="green" id="playBtn">播放（排队）</button>
+        <button class="red" id="abortBtn">强制打断</button>
+        <button class="warn" id="otaBtn">OTA 升级</button>
+        <button class="lite" id="refreshBtn">刷新</button>
+      </div>
+      <div class="pill" style="margin-top:6px;">当前音源：<b id="ttsInfo">读取中…</b>（换音色：启动服务前设环境变量 <code>TTS_VOICE</code>，如 <code>zh-CN-YunxiNeural</code>）</div>
+      <div class="pill" style="margin-top:6px;">OTA 期间门禁会拒绝一切其他命令；录音中禁止播放（板端会拒 INVALID_STATE）</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg, cls) => {
+  const el = $("log");
+  const t = new Date().toLocaleTimeString();
+  el.textContent += `[${t}] ${cls ? "" : ""}${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+const base = () => $("base").value.replace(/\/+$/, "");
+const headers = () => ({ "Content-Type": "application/json",
+  "Authorization": "Bearer " + $("token").value.trim() });
+
+// ---- 控制服务端口选择器（调试用）----
+const baseEl2 = $("base"), portInputEl = $("portInput"), portStateEl = $("portState");
+function applyPort(p, silent) {
+  p = parseInt(p, 10);
+  if (!p || p < 1 || p > 65535) return;
+  baseEl2.value = `http://${location.hostname}:${p}`;
+  portInputEl.value = p;
+  document.querySelectorAll(".portsel .pbtn").forEach(b =>
+    b.classList.toggle("active", parseInt(b.dataset.port, 10) === p));
+  const pe = $("port"); if (pe) pe.textContent = p;
+  if (!silent) { portStateEl.textContent = "已切到 " + baseEl2.value; refresh(); }
+}
+$("portGo").addEventListener("click", () => applyPort(portInputEl.value));
+document.querySelectorAll(".portsel .pbtn").forEach(b =>
+  b.addEventListener("click", () => applyPort(b.dataset.port)));
+// 自动识别当前服务控制端口
+fetch("/api/v1/info").then(r => r.json()).then(j => {
+  if (j && j.ok && j.http_port) {
+    applyPort(j.http_port, true);
+    portStateEl.textContent = "已自动识别控制端口 " + j.http_port + "（调试其他实例可选上方端口）";
+  } else {
+    applyPort(parseInt(location.port || "8000", 10), true);
+  }
+  const ti = document.getElementById("ttsInfo");
+  if (ti) ti.textContent = (j && j.tts) ? j.tts : "未知";
+}).catch(() => applyPort(parseInt(location.port || "8000", 10), true));
+
+// 设备状态 -> 颜色/文案
+const STATE_CLASS = { IDLE: "t-pending", LISTENING: "t-busy", SPEAKING: "t-busy",
+  MOVING: "t-busy", UPGRADING: "t-verifying", ERROR: "t-failed", OFFLINE: "t-failed" };
+const STATE_TEXT = { IDLE: "空闲", LISTENING: "录音中", SPEAKING: "播放中",
+  MOVING: "动作中", UPGRADING: "升级中", ERROR: "错误", OFFLINE: "离线" };
+const stateTag = (s) => {
+  const cls = STATE_CLASS[s] || "t-pending";
+  return `<span class="tag ${cls}">${STATE_TEXT[s] || s || "—"}</span>`;
+};
+const SRC_TEXT = { ws: "WebSocket", endpoint: "仅端点登记", http: "HTTP 心跳" };
+
+async function api(method, path, body) {
+  const res = await fetch(base() + path, {
+    method, headers: headers(),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  return { ok: res.ok, status: res.status, data };
+}
+
+const num = (v, unit) => (v == null || v === "" ? "—" : v + (unit || ""));
+
+async function refresh() {
+  const r = await api("GET", "/api/v1/devices");
+  const tb = $("devbody");
+  if (!r.ok || !r.data || !r.data.devices.length) {
+    tb.innerHTML = `<tr><td colspan="9" class="empty">暂无设备（ESP32 连 <code>?role=dog</code> 的 WS 发 hello 后自动出现）</td></tr>`;
+    return;
+  }
+  tb.innerHTML = r.data.devices.map(d => {
+    const conn = d.online
+      ? '<span class="tag t-succeeded">在线</span>'
+      : '<span class="tag t-failed">离线</span>';
+    const heap = d.free_heap != null ? (d.free_heap / 1000).toFixed(0) + "k" : "—";
+    const cur = d.running_slot || (d.busy ? "占用中" : "—");
+    return `<tr>
+      <td>${d.device_id}</td><td>${conn}</td><td>${SRC_TEXT[d.source] || d.source || "—"}</td>
+      <td>${d.fw_version || "—"}</td><td>${d.ip || "—"}</td>
+      <td>${num(d.rssi, "dBm")}</td><td>${heap}</td><td>${cur}</td>
+      <td>${num(d.age, "s")}</td></tr>`;
+  }).join("");
+}
+
+// 新版：控制台 -> 服务端 -> WS 下发给板子（走统一 JSON 命令入口）
+async function sendCommand(command, args, prio) {
+  const did = $("device").value.trim();
+  if (!did) { log("请填写目标设备 ID", "err"); return; }
+  const body = { command, args: args || {} };
+  if (prio != null) body.priority = prio;
+  log(`WS 下发 ${command} -> ${did} : ${JSON.stringify(args || {})}`);
+  const r = await api("POST", `/api/v1/devices/${did}/command`, body);
+  if (r.ok && r.data && r.data.ok) {
+    log(`  成功 P${r.data.priority} policy=${r.data.policy} 回执=${JSON.stringify((r.data.result || {}).data || {})}`, "ok");
+  } else {
+    log(`  失败 [${r.status}]：${JSON.stringify(r.data)}`, "err");
+  }
+  refreshStates();
+}
+
+async function refreshStates() {
+  const tb = $("stBody");
+  const r = await api("GET", "/api/v1/devices/state");
+  if (!r.ok || !r.data) { tb.innerHTML = `<tr><td colspan="7" class="empty">读取失败 [${r.status}]</td></tr>`; return; }
+  const ds = r.data.devices || {};
+  const ota = r.data.ota || {};
+  const ids = Object.keys(ds);
+  if (!ids.length) { tb.innerHTML = `<tr><td colspan="7" class="empty">暂无设备（板子连 ?role=dog 发 hello 后自动出现）</td></tr>`; return; }
+  tb.innerHTML = ids.map(id => {
+    const d = ds[id] || {};
+    const cur = (r.data.current || {})[id];
+    const q = (r.data.queue || {})[id] || 0;
+    const o = ota[id];
+    const age = d.age != null ? d.age + "s" : "—";
+    const otaTxt = o ? `<span class="tag ${o.phase === "succeeded" ? "t-succeeded" : (o.phase === "interrupted" || o.phase === "failed" || o.phase === "rollback") ? "t-failed" : "t-downloading"}">${o.phase}${o.version ? " " + o.version : ""}</span>` : "—";
+    return `<tr><td>${id}</td><td>${stateTag(d.state)}</td>
+      <td>${d.ws_alive ? '<span class="tag t-succeeded">已连</span>' : '<span class="tag t-failed">断开</span>'}</td>
+      <td>${cur ? cur.command + " P" + cur.priority : "—"}</td>
+      <td>${q}</td><td>${d.note ? d.note : age}</td><td>${otaTxt}</td></tr>`;
+  }).join("");
+}
+
+// ---- 设备端点（直推目标）管理 ----
+async function refreshEndpoints() {
+  const r = await api("GET", "/api/v1/device-endpoints");
+  const tb = $("epBody");
+  if (!r.ok || !r.data || !Object.keys(r.data.endpoints).length) {
+    tb.innerHTML = `<tr><td colspan="4" class="empty">暂无端点。ESP32 连音频 WS 后会自动按源 IP 注册，也可手动登记。</td></tr>`;
+    return;
+  }
+  tb.innerHTML = Object.entries(r.data.endpoints).map(([id, e]) => {
+    return `<tr>
+      <td>${id}</td>
+      <td>${e.host}:${e.port}</td>
+      <td>${e.auto ? "自动(WS)" : "手动"}</td>
+      <td><button class="ghost" data-ep="${id}" data-act2="test">测试</button>
+          <button class="warn" data-ep="${id}" data-act2="del">删除</button>
+          <button class="lite" data-ep="${id}" data-act2="use">用作目标</button></td>
+    </tr>`;
+  }).join("");
+}
+async function saveEndpoint() {
+  const did = $("epId").value.trim();
+  const host = $("epHost").value.trim();
+  if (!did || !host) { log("设备 ID 与 ESP32 IP 必填", "err"); return; }
+  const r = await api("POST", "/api/v1/device-endpoints", {
+    device_id: did, host, port: parseInt($("epPort").value || "80", 10),
+    token: $("epToken").value.trim(),
+  });
+  if (r.ok) { log(`已登记端点 ${did} -> ${host}:${$("epPort").value}`, "ok"); refreshEndpoints(); }
+  else { log(`登记失败 [${r.status}]: ${JSON.stringify(r.data)}`, "err"); }
+}
+async function epAction(id, act) {
+  if (act === "del") {
+    const r = await api("DELETE", `/api/v1/device-endpoints/${id}`);
+    log(r.ok ? `已删除端点 ${id}` : `删除失败：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+    refreshEndpoints();
+  } else if (act === "use") {
+    $("device").value = id;
+    log(`目标设备已设为 ${id}`, "ok");
+  } else if (act === "test") {
+    log(`测试连接 ${id}（发送 device.status）…`);
+    const r = await api("POST", `/api/v1/devices/${id}/command`, { command: "device.status", args: {} });
+    if (r.ok && r.data && r.data.ok) log(`  连通！板端回执：${JSON.stringify((r.data.result || {}).data || {})}`, "ok");
+    else log(`  不通 [${r.status}]：${JSON.stringify(r.data)}`, "err");
+  }
+}
+$("epSave").addEventListener("click", saveEndpoint);
+$("epRefresh").addEventListener("click", refreshEndpoints);
+$("epBody").addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-ep]");
+  if (b) epAction(b.dataset.ep, b.dataset.act2);
+});
+
+const targetDid = () => $("device").value.trim();
+
+document.querySelectorAll("[data-cmd]").forEach(b => {
+  b.addEventListener("click", () => {
+    sendCommand(b.dataset.cmd, JSON.parse(b.dataset.args || "{}"),
+                parseInt(b.dataset.prio, 10));
+  });
+});
+
+document.querySelectorAll("[data-face]").forEach(b => {
+  b.addEventListener("click", async () => {
+    const did = targetDid();
+    if (!did) { log("请填写目标设备 ID", "err"); return; }
+    log(`下发表情 ${b.dataset.face} -> ${did}`);
+    const r = await api("POST", `/api/v1/devices/${did}/face`, { name: b.dataset.face });
+    log(r.ok ? `  表情已显示（5s 后回状态）` : `  失败 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+    refreshStates();
+  });
+});
+
+$("playBtn").addEventListener("click", async () => {
+  const did = targetDid();
+  if (!did) { log("请填写目标设备 ID", "err"); return; }
+  const text = $("playText").value;
+  log(`入队播放 -> ${did}：${text}`);
+  const r = await api("POST", `/api/v1/devices/${did}/play`, { text });
+  log(r.ok ? `  已入队（60ms/帧 节奏下行）` : `  被拒 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  refreshStates();
+});
+
+$("abortBtn").addEventListener("click", async () => {
+  const did = targetDid();
+  if (!did) { log("请填写目标设备 ID", "err"); return; }
+  const r = await api("POST", `/api/v1/devices/${did}/audio/abort`, {});
+  log(r.ok ? `  已强制打断，队列已清空` : `  打断失败：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  refreshStates();
+});
+
+$("otaBtn").addEventListener("click", async () => {
+  const did = targetDid();
+  if (!did) { log("请填写目标设备 ID", "err"); return; }
+  log(`下发 OTA -> ${did}（板端目前为预留实现）…`);
+  const r = await api("POST", `/api/v1/devices/${did}/ota/start`, {});
+  log(r.ok ? `  OTA 已触发 phase=${(r.data || {}).phase}` : `  失败 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  refreshStates();
+});
+
+$("refreshBtn").addEventListener("click", () => { refreshStates(); refresh(); });
+
+// 初始化
+log("管理台已加载，开始轮询设备…");
+refresh();
+refreshEndpoints();
+refreshStates();
+setInterval(refresh, 3000);
+setInterval(refreshStates, 2000);
+</script>
+</body>
+</html>

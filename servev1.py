@@ -4,6 +4,7 @@
 协议（按需求规格）
 -----------------
   mic ESP32  --(WebSocket 二进制, 纯 PCM, ?role=mic)-->  本服务器  --FunASR SenseVoice / faster-whisper-->  中文原文
+  xiaozhi/dog ESP32  --(WebSocket OPUS, ?role=xiaozhi / ?role=dog)-->  本服务器  --解码→FunASR-->  中文原文
   browser UI  --(WebSocket JSON, ?role=dash)---------->  监测状态(电平/按钮/识别结果)
 
 PCM 格式：16000 Hz、有符号 int16、小端、单声道、无压缩、无 WAV 头、无 JSON。
@@ -16,6 +17,7 @@ PCM 格式：16000 Hz、有符号 int16、小端、单声道、无压缩、无 W
 """
 import argparse
 import asyncio
+import datetime
 import json
 import math
 import os
@@ -24,9 +26,17 @@ import re
 import socket
 import threading
 import time
+import http.server
 
-import numpy as np
-import websockets
+# 顶层重量级依赖改为惰性容错：缺 numpy/websockets 时不影响“仅控制服务”模式导入与运行。
+try:
+    import numpy as np
+except Exception:  # noqa: BLE001
+    np = None
+try:
+    import websockets
+except Exception:  # noqa: BLE001
+    websockets = None
 
 import struct
 import uuid
@@ -45,17 +55,27 @@ try:
             os.environ["PATH"] = _proj_dir + os.pathsep + os.environ.get("PATH", "")
     import opuslib_next
     _OPUS_DECODER = lambda sr=16000, ch=1: opuslib_next.Decoder(sr, ch)
+    _OPUS_ENCODER = lambda sr=16000, ch=1, app="voip": opuslib_next.Encoder(sr, ch, app)
 except Exception:  # noqa: BLE001
     opuslib_next = None
     _OPUS_DECODER = None
+    _OPUS_ENCODER = None
 
 XZ_OPUS_SR = 16000          # xiaozhi 上传的 OPUS 采样率
 XZ_FRAME_MS = 60            # OPUS 帧长（与固件 OPUS_FRAME_DURATION_MS 一致）
 XZ_FRAME_SAMPLES = XZ_OPUS_SR * XZ_FRAME_MS // 1000   # 960 采样/帧 = 1920 字节 PCM
 
+# ===========================================================================
+# 代码段导航（在本文件内检索关键词定位）
+#   [A] 配置与全局状态        : 下方“可配置参数”段（PORT / 引擎 / 全局变量）
+#   [B] 语音 ASR 服务(WS:8765) : [B] 段（Denoiser→transcribe→asr_worker→handler/monitor→xiaozhi 协议）
+#   [C] 设备控制/OTA(HTTP:8000): [C] CTRL_SERVER 段（状态/加载器/队列/路由/启动）
+#   [D] 入口 main()            : [D] 段（统一编排两套服务的启动）
+# ===========================================================================
+
 # ---- 可配置参数（命令行可覆盖） ------------------------------------------
 PORT = 8765             # WebSocket 端口（麦克风 / 监测）
-HTTP_PORT = 8080        # 监测 GUI 的 HTTP 端口（index.html）
+HTTP_PORT = 8080        # 监测 GUI 端口（已废弃：语音监测台改由控制服务 :8000/voice 提供）
 SAMPLE_RATE = 16000
 SAMPLE_BYTES = 2        # int16
 FRAME_SAMPLES = 320     # 20ms @ 16k
@@ -67,7 +87,7 @@ DEVICE = "cpu"
 COMPUTE = "int8"
 ENGINE = "funasr"      # ASR 引擎：funasr=SenseVoice（中文抗噪强）/ whisper=faster-whisper
 
-clients = {"mic": set(), "dash": set(), "xz": set()}   # xz = xiaozhi 采集端
+clients = {"mic": set(), "dash": set(), "xz": set(), "dog": set()}   # xz = xiaozhi 采集端；dog = 机器狗专用采集端（协议同 xiaozhi）
 mic_state = {}          # ws -> {"buf","last","recording","level"}
 xz_state = {}           # ws -> xiaozhi 会话状态（version/sample_rate/buf/recording...）
 asr = None
@@ -78,6 +98,13 @@ SAVE_WAV = False          # --save-wav：把每段提交的音频存成 wav，�
 DENOISE = True           # 软件降噪（50/100/150Hz 陷波 + 高低通）默认开
 VAD = True                # Whisper VAD 语音活动检测；强电流麦下建议 --no-vad
 
+
+# ===========================================================================
+# [B] 语音 ASR 服务（WebSocket :8765）
+# 四类客户端：?role=mic（裸 PCM）/ ?role=xiaozhi（OPUS）/ ?role=dog（机器狗 OPUS，同 xiaozhi 协议）/ ?role=dash（监测）
+# 识别管线：Denoiser 降噪 -> transcribe -> asr_worker(阻塞线程) -> broadcast_dash
+# 本段与 [C] 控制服务零耦合，仅共享进程与 main() 启动时序。
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # 软件降噪（仅在 --no-denoise 未指定时启用）
@@ -415,6 +442,16 @@ def asr_worker():
                 asyncio.run_coroutine_threadsafe(
                     _send_json(ws, {"type": "stt", "text": text, "session_id": sid}), LOOP)
         print(f"[asr] 识别结果：{text if text else '(空)'}（耗时 {dt}ms）")
+
+        # [C-7] 大脑层开了就把这句话交给大模型（后台线程，不阻塞识别队列）
+        if BRAIN is not None and text:
+            did = _device_id_by_ws(ws) or os.environ.get("DOG_BRAIN_DEVICE")
+            if did:
+                brain_say(did, text)
+            else:
+                print("[brain] 该连接未绑定设备，跳过（可用 DOG_BRAIN_DEVICE 指定默认设备）",
+                      flush=True)
+
         if PC_INPUT and text:
             if PC_INPUT_CONFIRM:
                 # 确认模式：先缓存，等板子发 confirm 才注入，避免识别错误直接灌进窗口
@@ -498,6 +535,8 @@ async def handler(ws, path=None):
     req_path = getattr(getattr(ws, "request", None), "path", path) or ""
     if "role=xiaozhi" in req_path:
         role = "xz"
+    elif "role=dog" in req_path:
+        role = "dog"
     elif "role=mic" in req_path:
         role = "mic"
     elif "role=dash" in req_path:
@@ -510,7 +549,7 @@ async def handler(ws, path=None):
         role = "dash"  # 浏览器不带 role 默认识别为监测端；若收到 hello 则自动升级为 xiaozhi 设备
 
     clients[role].add(ws)
-    print(f"[{role}] 已连接（mic={len(clients['mic'])} xz={len(xz_state)} dash={len(clients['dash'])}）")
+    print(f"[{role}] 已连接（mic={len(clients['mic'])} xz+dog={len(xz_state)} dash={len(clients['dash'])}）")
 
     if role == "dash":
         await broadcast_dash({
@@ -520,7 +559,7 @@ async def handler(ws, path=None):
         await broadcast_asr_status()
         await broadcast_mic_status()   # 主动补推一次连接状态（前端可能晚于事件连入）
 
-    is_xz = (role == "xz")
+    is_xz = (role in ("xz", "dog"))
     mon = None
     if role == "mic":
         mic_state[ws] = {"buf": bytearray(), "last": 0.0, "recording": False, "level": 0.0, "ending": False}
@@ -528,9 +567,10 @@ async def handler(ws, path=None):
         await broadcast_dash({"type": "event", "msg": "麦克风已连接"})
         await broadcast_mic_status()
     elif is_xz:
+        label = "dog 采集端" if role == "dog" else "xiaozhi 采集端"
         xz_state[ws] = {"buf": bytearray(), "last": 0.0, "recording": False,
-                        "level": 0.0, "ending": False, "mode": "xz", "version": 0}
-        await broadcast_dash({"type": "event", "msg": "xiaozhi 采集端已连接，等待 hello"})
+                        "level": 0.0, "ending": False, "mode": role, "version": 0}
+        await broadcast_dash({"type": "event", "msg": f"{label} 已连接，等待 hello"})
         await broadcast_mic_status()
 
     try:
@@ -544,7 +584,7 @@ async def handler(ws, path=None):
                             prev = f"binary {len(message)}B head={bytes(message[:8]).hex()}"
                         else:
                             prev = f"text {len(message)}B: {message[:200]!r}"
-                        msg_dbg = f"[xz-dbg #{st_dbg['dbg_n']}] {prev}"
+                        msg_dbg = f"[{role}-dbg #{st_dbg['dbg_n']}] {prev}"
                         print(msg_dbg, flush=True)
                         await broadcast_dash({"type": "event", "msg": msg_dbg})
             if isinstance(message, (bytes, bytearray)):
@@ -589,10 +629,15 @@ async def handler(ws, path=None):
             await broadcast_mic_status()
         if is_xz or ws in xz_state:
             xz_state.pop(ws, None)
+            did_gone = WS_DEVICE.pop(ws, None)          # 先取出再解绑，便于打印
+            dev_unbind_ws(did_gone, ws)                 # 解绑下行目标
             with pending_lock:
                 pending_pc_input.pop(ws, None)   # 清理该连接的待确认文本，避免内存泄漏
             clients["xz"].discard(ws)
-            await broadcast_dash({"type": "event", "msg": "xiaozhi 采集端断开"})
+            clients["dog"].discard(ws)
+            label = "dog 采集端" if role == "dog" else "xiaozhi 采集端"
+            print(f"[{role}] 断开 device={did_gone or ip} ({label})", flush=True)
+            await broadcast_dash({"type": "event", "msg": f"{label} 断开"})
             await broadcast_mic_status()
         clients[role].discard(ws)
 
@@ -697,6 +742,27 @@ async def xz_handle_hello(ws, j):
     st["sample_rate"] = sr
     st["frame_duration"] = fd
     st["session_id"] = str(uuid.uuid4())
+    # 自动登记设备端点（新版双向架构）：用 WS 源 IP 作为 ESP32 的 HTTP 主机，供控制台下发指令时直推
+    try:
+        ra = getattr(ws, "remote_address", None)
+        src_ip = ra[0] if isinstance(ra, (tuple, list)) and ra else None
+        # hello 里带 device_id 最优；没有就用源 IP 兜底，保证下行仍有目标
+        did = j.get("device_id") or j.get("id") or src_ip
+        http_port = int(j.get("http_port") or 80)
+        if did:
+            st["device_id"] = did
+            WS_DEVICE[ws] = did
+            dev_bind_ws(did, ws, session_id=st["session_id"], ip=src_ip)
+            if src_ip:
+                device_endpoint_register(did, src_ip, http_port, auto=True)
+                print(f"[ctrl] 设备 {did} 已登记 -> {src_ip}:{http_port}")
+            # hello 里若顺带写了固件版本/内存/信号等，一并记下来
+            metrics = pick_metrics(j)
+            if metrics:
+                dev_set_state(did, "IDLE", ip=src_ip, metrics=metrics)
+                print(f"[ctrl] 设备 {did} 上报运行数据 {metrics}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
     hello = {
         "type": "hello",
         "version": 1,           # 对齐官方服务端回包（携带 version 字段）
@@ -752,6 +818,27 @@ async def xz_handle_text(ws, message):
         # 否则板端会一直 Start listening failed: ESP_ERR_INVALID_STATE
         await xz_handle_hello(ws, j)
         return
+    if t == "command_result":
+        # 板子对 WS 控制指令的回执，唤醒等待中的同步调用
+        ws_on_command_result(j)
+        return
+    if t == "state":
+        # 板子周期状态上报（平时走这条；OTA 阶段 WS 可能已停，改走 HTTP /state）
+        did = j.get("device_id") or st.get("device_id")
+        if did:
+            metrics = pick_metrics(j)
+            # 板端目前不单独发 state 字段，只回 servo_busy / sequence_playing 这类布尔量，
+            # 这里按它推导，省得每来一条就把它打回 IDLE（那会误放掉动作占用，后续命令判空）。
+            cur = str(j.get("state") or j.get("mode") or "").upper()
+            if cur not in DEV_STATES:
+                if j.get("servo_busy") or j.get("sequence_playing"):
+                    cur = "MOVING"
+                elif j.get("wifi_connected") is False:
+                    cur = "ERROR"
+                else:
+                    cur = "IDLE"
+            dev_set_state(did, cur, ip=(j.get("ip") or None), metrics=metrics or None)
+        return
     if t == "listen":
         state = j.get("state")
         if state == "start":
@@ -760,12 +847,16 @@ async def xz_handle_text(ws, message):
             st["ending"] = False
             st["last"] = time.monotonic()
             print("[xz] 开始说话（listen start）")
+            if st.get("device_id"):
+                dev_set_state(st["device_id"], "LISTENING")
             await broadcast_dash({"type": "event", "msg": "开始说话（按键/唤醒）"})
             await broadcast_mic_status()
         elif state == "stop":
             print("[xz] 停止（listen stop）")
             await broadcast_dash({"type": "event", "msg": "提交识别（listen stop）"})
             submit_buffer(ws, st)
+            if st.get("device_id"):
+                dev_set_state(st["device_id"], "IDLE")
         # state=="detect" 为唤醒词事件，无需处理
     elif t == "abort":
         if st["recording"]:
@@ -825,6 +916,8 @@ def submit_buffer(ws, st):
         asyncio.run_coroutine_threadsafe(broadcast_mic_status(), LOOP)
 
 
+# [遗留] 旧的独立监测台 HTTP 服务（:8080）。已被控制服务的 :8000/voice 取代，
+# main() 不再调用本函数；保留仅供兼容参考，请勿在新流程中使用。
 # ---------------------------------------------------------------------------
 # HTTP：监测 GUI（index.html）
 # ---------------------------------------------------------------------------
@@ -836,8 +929,2106 @@ def serve_http():
                            http.server.SimpleHTTPRequestHandler).serve_forever()
 
 
+# ===========================================================================
+# 设备控制 / OTA 服务端（HTTP 局域网轮询协议 v1，端口默认 8000）
+# 与 ASR(WebSocket 8765) 完全独立：独立线程 + 独立路由 + 独立状态。
+# 语音监测台(index.html) 改由本服务在 /voice 统一托管（不再单独起 :8080）。
+# 协议：ESP32 主动轮询 GET /api/v1/devices/{id}/commands/next；
+#       PC 管理端 POST /api/v1/devices/{id}/commands 下发指令；
+#       固件 GET /firmware/esp32s3/{version}/app.bin。
+# 指令类型：servo_action / action_group / stop / reboot / ota。
+# OTA 状态机：pending -> accepted -> downloading -> verifying -> rebooting
+#            -> succeeded / failed / rollback。
+# ===========================================================================
+CTRL_ENABLED = True
+CTRL_ONLY = False
+CTRL_HOST = "0.0.0.0"
+CTRL_PORT = 8000
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FIRMWARE_DIR = os.path.join(_SCRIPT_DIR, "firmware")
+CTRL_HTML = os.path.join(_SCRIPT_DIR, "ctrl.html")
+INDEX_HTML = os.path.join(_SCRIPT_DIR, "index.html")     # 语音监测台（原 :8080 监测 GUI）
+PORTAL_HTML = os.path.join(_SCRIPT_DIR, "portal.html")   # 聚合首页：/ 入口
+BRAIN_HTML = os.path.join(_SCRIPT_DIR, "brain.html")     # 大模型决策调试台
+TWIN_HTML = os.path.join(_SCRIPT_DIR, "twin.html")       # 数字孪生主控台（从板端搬来）
+DEVICE_TOKENS_FILE = None
+CTRL_DEV_TOKEN = "dev-token-change-me"   # 开发默认 token；生产请改用 --device-tokens 配置
+
 # ---------------------------------------------------------------------------
-# 启动
+# [C-1] 状态存储（模块级全局 + 锁）
+# DEVICES   设备注册表（心跳登记）  CMD_QUEUES 每设备唯一未完成指令
+# FIRMWARE  固件索引                DEVICE_TOKENS 设备 token 表
+# ---------------------------------------------------------------------------
+DEVICES = {}          # device_id -> {fw_version, ip, rssi, free_heap, psram_free, busy, running_slot, last_heartbeat, last_status}
+CMD_QUEUES = {}       # device_id -> 当前唯一指令(dict) 或 None（一设备同时仅一个未完成指令）
+FIRMWARE = {}         # version -> {device, version, path, size, sha256}
+DEVICE_TOKENS = {}    # device_id -> token
+CTRL_LOCK = threading.Lock()
+
+# ===========================================================================
+# [C-6] 每设备状态机 + 会话注册表 —— 所有下行的调度中枢
+#   状态由板子周期上报（平时走 WS 文本帧，OTA 阶段走 HTTP，因为那时 WS 已停）。
+#   服务端据此做：录音/播放互斥、舵机优先级抢占、busy 拒绝、OTA 全量门禁。
+# ===========================================================================
+DEV_STATES = ("IDLE", "LISTENING", "SPEAKING", "MOVING", "UPGRADING", "ERROR", "OFFLINE")
+STATE_TTL_S = 15.0          # 超过该秒数未上报 -> 判定 OFFLINE（仅在 WS 已断时才生效）
+ACTION_TTL_S = 30.0         # 单个动作占用上限；超时未见板子回报完成则自动释放，避免永久锁死
+OTA_TTL_S = 600.0           # OTA 会话上限（10 分钟）；超时未见终态则判 failed，避免永久门禁
+# 板端 display_face.c 的 s_face_names 全表，字面必须完全一致（拼错板子直接 400）
+FACES = ("idle", "listening", "thinking", "speaking",
+         "happy", "angry", "sad", "joy", "error", "sleep")
+FACE_DEFAULT_MS = 5000      # 表情默认持续 5s，播完自动回状态显示
+
+# 板端可在 hello 或 {"type":"state"} 上报里顺带写的运行数据（有就记，没有就显示 —）
+METRIC_FIELDS = ("fw_version", "free_heap", "psram_free", "rssi", "uptime_sec",
+                 "running_slot", "ip")
+# 板端同一项在不同报文里叫法不一样（device.status 里是 free_psram、free_internal），
+# 这里给每个指标列别名，取到后统一按 METRIC_FIELDS 的名字入库，前端只认一套名字。
+METRIC_ALIASES = {
+    "psram_free": ("free_psram",),
+    "free_heap": ("free_internal",),
+    "rssi": ("wifi_rssi",),
+    "uptime_sec": ("uptime", "uptime_s", "uptime_ms"),
+}
+# 板端 device.status 里的健康类布尔/计数，顺手收下来，供 UI 或排查用
+METRIC_FLAGS = ("wifi_connected", "servo_busy", "sequence_playing", "audio_ws_ready",
+                "audio_capture", "audio_playback", "playback_buffer_bytes",
+                "playback_dropped_bytes")
+
+
+def pick_metrics(src):
+    """从板端上报（hello / state / device.status）里挑出运行数据并归一字段名。
+
+    板端字段名不统一：device.status 回的是 free_psram / free_internal，而 UI 认的是
+    psram_free / free_heap。在这层做别名映射，板端保持自己现有命名即可。
+    """
+    if not isinstance(src, dict):
+        return {}
+    out = {}
+    for k in METRIC_FIELDS:
+        for name in (k,) + tuple(METRIC_ALIASES.get(k) or ()):
+            v = src.get(name)
+            if v is not None:
+                out[k] = v
+                break
+    for k in METRIC_FLAGS:
+        v = src.get(k)
+        if v is not None:
+            out[k] = v
+    return out
+
+DEV_STATE = {}      # device_id -> {state, since, seq, last_seen, ip, session_id}
+DEV_WS = {}         # device_id -> ws（音频下行 socket，hello 时按 device_id 绑定）
+WS_DEVICE = {}      # ws -> device_id（断连时反查，用于解绑）
+DEV_CURRENT = {}    # device_id -> {command, priority, since, protect} 当前舵机动作
+PLAY_QUEUE = {}     # device_id -> [ {id, text} ] 待播队列
+PLAY_CURRENT = {}   # device_id -> {id, abort, thread} 正在播放
+OTA_SESSION = {}    # device_id -> {phase, version, since}
+DEV_LOCK = threading.RLock()
+
+# 命令优先级（服务端侧门禁）：数字越小越优先。
+# 对照板端协议文档：policy=interrupt 的（停止类/单步类）排 P0~P2；policy=queue 的排 P3。
+SERVO_PRIORITY = {
+    "motion.emergency_stop": 0,     # 急停：最高优先级，policy=interrupt
+    "action.stop": 1,               # 停止动作组：interrupt
+    "sequence.stop": 1,             # 停止序列：interrupt
+    "audio.play.stop": 1,           # 停止播放：interrupt
+    "audio.capture.stop": 1,        # 停止录音：interrupt
+    "device.reboot": 1,             # 重启：interrupt（且必须 async，重启后收不到回执）
+    "servo.move": 2,                # 舵机移动：interrupt
+    "servo.unload": 2,              # 舵机卸力：interrupt
+    "audio.capture.start": 2,       # 开始录音：interrupt
+    "action.run": 3,                # 动作组：queue
+    "action.speed": 3,              # 动作速度：queue
+    "sequence.run": 3,              # 长动作序列：queue
+    "display.face": 9,              # 表情：可与舵机并行，不参与 busy 判定
+}
+PROTECTED_COMMANDS = {"sequence.run"}   # 长动作序列：仅 P0/P1 可打断，不被 P2/P3 覆盖
+
+# 只读查询命令：不占用设备（不写 DEV_CURRENT / 不置 MOVING），也不受 busy 门禁限制
+READONLY_COMMANDS = {"device.status", "servo.position.read", "servo.battery.read"}
+
+# 板端协议明确要求的默认 policy（优先于按优先级推导）
+COMMAND_POLICY = {
+    "motion.emergency_stop": "interrupt",
+    "action.stop": "interrupt",
+    "sequence.stop": "interrupt",
+    "audio.play.stop": "interrupt",
+    "audio.capture.start": "interrupt",
+    "audio.capture.stop": "interrupt",
+    "servo.move": "interrupt",
+    "servo.unload": "interrupt",
+    "sequence.run": "queue",
+    "display.face": "queue",
+}
+
+# 默认 mode：这些命令板端不会/不适合回 command_result，用 async 只确认送达
+COMMAND_MODE = {
+    "device.reboot": "async",       # 重启后连接即断开，sync 必定超时
+    "sequence.run": "async",        # 协议文档示例为 async
+    "action.run": "async",
+    "display.face": "async",        # 协议文档示例为 async
+}
+
+TTS_HOOK = None     # 可插拔 TTS：def hook(text) -> 16k/单声道/int16 PCM 字节
+TTS_NAME = "提示音占位（未接 TTS）"   # 供 /api/v1/info 与控制台显示当前音源
+
+
+def _broadcast_state(device_id):
+    """把设备状态变化推给监测台（从任意线程安全地投递到 asyncio 循环）。"""
+    if not LOOP:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            broadcast_dash({"type": "dev_state", "device_id": device_id,
+                            "state": dev_get_state(device_id)}), LOOP)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dev_metrics_sync(device_id, ip=None, metrics=None):
+    """把 WS 侧上报的运行数据同步进旧注册表 DEVICES（任一上行里带了就算有值）。
+    这样控制台 /api/v1/devices 那张表不用等 HTTP 心跳也能显示真实数值。"""
+    try:
+        with CTRL_LOCK:
+            d = DEVICES.setdefault(device_id, {})
+            if ip:
+                d["ip"] = ip
+            for k in METRIC_FIELDS + METRIC_FLAGS:
+                if metrics and metrics.get(k) is not None:
+                    d[k] = metrics[k]
+            d["last_heartbeat"] = _ctrl_now_iso()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dev_set_state(device_id, state, ip=None, session_id=None, metrics=None):
+    """更新设备状态；metrics 携带板端运行数据（固件/内存/信号/uptime 等）。"""
+    if state not in DEV_STATES:
+        return False
+    with DEV_LOCK:
+        rec = DEV_STATE.get(device_id) or {}
+        changed = rec.get("state") != state
+        rec.update({"state": state, "since": time.time(), "last_seen": time.time()})
+        if ip:
+            rec["ip"] = ip
+        if session_id:
+            rec["session_id"] = session_id
+        if metrics:
+            m = dict(rec.get("metrics") or {})
+            m.update({k: v for k, v in metrics.items() if v is not None})
+            rec["metrics"] = m
+        rec["seq"] = int(rec.get("seq", 0)) + 1
+        DEV_STATE[device_id] = rec
+        # 板子回到空闲/错误/离线：释放动作占用，否则后续 P3 命令会被永久判 busy（死锁）
+        if state in ("IDLE", "ERROR", "OFFLINE"):
+            DEV_CURRENT.pop(device_id, None)
+    # 周期上报带上板端运行数据：同步到旧注册表，让控制台那些列有真实数值
+    if metrics or ip:
+        _dev_metrics_sync(device_id, ip=ip, metrics=metrics)
+    if changed:
+        print(f"[dev] {device_id} -> {state}", flush=True)
+        _broadcast_state(device_id)
+    return changed
+
+
+def _ws_alive(ws):
+    """判断 WebSocket 连接是否仍然活着（兼容新旧 websockets 库）。"""
+    if ws is None:
+        return False
+    try:
+        closed = getattr(ws, "closed", None)
+        if isinstance(closed, bool):
+            return not closed
+        stt = getattr(ws, "state", None)
+        if stt is not None:
+            name = str(getattr(stt, "name", stt)).upper()
+            return name in ("OPEN", "CONNECTING")
+        return True          # 判断不了就当活着，避免误杀
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def dev_get_state(device_id):
+    """读状态，带 TTL 过期判定。
+
+    关键：TTL 只在**没有活着的 WS 连接**时才判 OFFLINE。
+    只要 socket 还在，即便板子长时间没上报（例如无周期心跳、只在事件时上报），
+    也只标记 stale=True，不能把在线设备误判离线而拒绝下发命令
+    （UPGRADING 不判过期，升级本身可能很慢）。
+    """
+    with DEV_LOCK:
+        rec = DEV_STATE.get(device_id)
+        ws = DEV_WS.get(device_id)
+    if not rec:
+        return None
+    alive = _ws_alive(ws)
+    age = time.time() - rec.get("last_seen", 0)
+    out = dict(rec)
+    out["age"] = round(age, 1)
+    out["ws_alive"] = alive
+    expired = age > STATE_TTL_S and rec.get("state") != "UPGRADING"
+    if expired and not alive:
+        out["state"] = "OFFLINE"
+        out["stale"] = True
+    else:
+        out["stale"] = bool(expired)   # 连着但状态陈旧
+    return out
+
+
+def _release_stale_ota(device_id):
+    """兜底：OTA 会话长时间既没有推进也没有终态（板子中途死机/断网），
+    自动判失败。否则 OTA 门禁会永久拒绝该设备的一切命令。"""
+    with DEV_LOCK:
+        ota = OTA_SESSION.get(device_id)
+        if not ota:
+            return False
+        if ota.get("phase") in ("succeeded", "failed", "rollback", "interrupted"):
+            return False
+        if time.time() - ota.get("since", 0) <= OTA_TTL_S:
+            return False
+        ota = dict(ota)
+        ota.update({"phase": "failed", "since": time.time(),
+                    "error": f"OTA 超时未回报终态（>{int(OTA_TTL_S)}s）"})
+        OTA_SESSION[device_id] = ota
+        print(f"[ota] {device_id} 超时未回报终态，自动判失败", flush=True)
+        return True
+
+
+def dev_state_all():
+    # 每次对外输出前先做一次兜底清理，保证 UI 上看到的不是残留的旧数据
+    with DEV_LOCK:
+        ids = sorted(set(list(DEV_STATE) + list(DEV_WS) + list(DEVICE_ENDPOINTS)))
+    for d in ids:
+        try:
+            _release_stale_action(d)
+            _release_stale_ota(d)
+        except Exception:  # noqa: BLE001
+            pass
+    return {d: (dev_get_state(d) or _unreported(d)) for d in ids}
+
+
+def _unreported(device_id):
+    """只在端点表里登记过、从未上报过状态的条目（如手动登记的 IP）。"""
+    ep = DEVICE_ENDPOINTS.get(device_id) or {}
+    out = {"state": "OFFLINE", "note": "从未上报", "age": None}
+    if ep:
+        out["ip"] = ep.get("host")
+        out["http_port"] = ep.get("port")
+        out["source"] = "auto(WS)" if ep.get("auto") else "manual"
+    return out
+
+
+def dev_bind_ws(device_id, ws, session_id=None, ip=None):
+    with DEV_LOCK:
+        DEV_WS[device_id] = ws
+    if session_id or ip:
+        with DEV_LOCK:
+            rec = DEV_STATE.get(device_id) or {}
+            if session_id:
+                rec["session_id"] = session_id
+            if ip:
+                rec["ip"] = ip
+            rec["last_seen"] = time.time()
+            DEV_STATE[device_id] = rec
+    print(f"[dev] {device_id} 已绑定音频 WS", flush=True)
+
+
+def dev_unbind_ws(device_id, ws=None):
+    """WS 断连：解绑下行目标，并清理该设备所有运行时占用。
+
+    以前只把 state 改成 OFFLINE，导致断开后残留：
+      DEV_CURRENT（界面一直显示旧动作、且重连后 gate 误判 busy）
+      PLAY_QUEUE / PLAY_CURRENT（播放线程可能还在跑）
+      OTA_SESSION（卡在 downloading，永久性 OTA 门禁，拒绝一切命令）
+    """
+    if not device_id:
+        return
+    with DEV_LOCK:
+        if ws is None or DEV_WS.get(device_id) is ws:
+            DEV_WS.pop(device_id, None)
+        rec = DEV_STATE.get(device_id)
+        if rec:
+            rec["state"] = "OFFLINE"
+            rec["ws_alive"] = False
+            rec["last_seen"] = rec.get("last_seen", time.time())
+            DEV_STATE[device_id] = rec
+        cur = DEV_CURRENT.pop(device_id, None)
+        queue = PLAY_QUEUE.pop(device_id, None)
+        playing = PLAY_CURRENT.get(device_id)
+        ota = OTA_SESSION.get(device_id)
+        if ota and ota.get("phase") not in ("succeeded", "failed", "rollback", "interrupted"):
+            ota = dict(ota)
+            ota.update({"phase": "interrupted", "since": time.time(),
+                        "error": "WebSocket 断连"})
+            OTA_SESSION[device_id] = ota
+    # 播放线程置 abort，让它尽快自行退出（不放锁，避免死锁）
+    if playing:
+        try:
+            playing["abort"] = True
+            playing["aborted"] = True
+        except Exception:  # noqa: BLE001
+            pass
+    if cur or queue or playing:
+        print(f"[dev] {device_id} 断连清理：占用={cur and cur.get('command')} "
+              f"队列={len(queue or [])} 播中={bool(playing)}", flush=True)
+    # 孪生后台线程（步态/动作组循环）也要停：板子都断了，再空转没有意义，
+    # 而且会给一台离线设备继续刷 servo.move，日志和控制台都不好看。
+    try:
+        if TWIN_GAIT is not None or TWIN_SEQ is not None:
+            twin_stop_all(device_id, reason="ws disconnected")
+    except Exception as e:  # noqa: BLE001
+        print(f"[twin] 断连停步态失败：{e}", flush=True)
+
+
+def dev_get_ws(device_id):
+    with DEV_LOCK:
+        return DEV_WS.get(device_id)
+
+
+def _release_stale_action(device_id):
+    """兜底：动作占用超时未见板子回报完成，自动释放，避免服务端把设备永久锁在 busy。
+
+    TTL 优先取该命令自己的预计时长（hold_ms）：servo.move 带 time=300 就只占 0.6s，
+    不必干等 30s。板端目前不发周期 state 上报，"板子回 IDLE 才释放"这条路走不通，
+    所以瞬时命令必须靠自己的时长自我了断——否则手动下发一次舵机，30 秒内谁都动不了。
+    """
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+        ttl = None
+        if cur:
+            hold = cur.get("hold_ms")
+            ttl = (hold / 1000.0) if hold is not None else ACTION_TTL_S
+        if cur and time.time() - cur.get("since", 0) > ttl:
+            DEV_CURRENT.pop(device_id, None)
+            print(f"[dev] {device_id} 动作占用超时未回报({cur.get('command')}, "
+                  f"{cur.get('hold_ms') or int(ACTION_TTL_S * 1000)}ms)，自动释放",
+                  flush=True)
+            momentary = cur.get("command") in ("servo.move", "servo.unload")
+            cmd = cur.get("command")
+        else:
+            momentary, cmd = False, None
+    # 瞬时舵机命令跑完了就该回到 IDLE；长命令/序列的状态交给板子上报决定
+    if momentary:
+        st = dev_get_state(device_id) or {}
+        if st.get("state") == "MOVING":
+            dev_set_state(device_id, "IDLE")
+    return bool(cmd)
+
+
+def dev_gate(device_id, command, policy=None):
+    """门禁：返回 (ok, reason, hint)。所有下行命令都先过这里。
+
+    policy="interrupt" 表示这条命令就是要抢占板子的当前动作（大脑层下的动作都走这条），
+    此时不按 busy 拒绝——否则主人连着说两个动作，第二条会被自家门禁挡掉。
+    """
+    st = dev_get_state(device_id) or {}
+    cur_state = st.get("state", "OFFLINE")
+    prio = SERVO_PRIORITY.get(command, 3)
+    if cur_state == "UPGRADING":
+        return False, "upgrading", "设备正在 OTA 升级，拒绝一切命令"
+    if cur_state == "OFFLINE" and st.get("stale") and not st.get("ws_alive"):
+        return False, "offline", "WebSocket 已断开且长时间未上报状态，可能已离线"
+    # 只读查询 / 设备级命令（status、reboot、read）：不占设备，不受 busy 限制
+    if command in READONLY_COMMANDS or command.startswith("device."):
+        return True, "ok", ""
+    # 表情与媒体类：可与舵机动作并行，只受 OTA 门禁 + 录音/播放互斥约束
+    if command == "display.face" or command.startswith("audio."):
+        if cur_state == "LISTENING" and command.startswith("audio.play"):
+            return False, "busy", "正在录音，禁止同时播放（板端会拒 INVALID_STATE）"
+        if cur_state == "SPEAKING" and command.startswith("audio.capture"):
+            return False, "busy", "正在播放，禁止同时录音（避免自触发）"
+        return True, "ok", ""
+    if _release_stale_action(device_id):
+        dev_set_state(device_id, "IDLE")
+        cur_state = "IDLE"
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+    if cur and cur.get("protect") and prio >= 2:
+        return False, "busy", f"长动作序列执行中（{cur.get('command')}），仅急停/停止可打断"
+    if cur and prio >= 3 and policy != "interrupt":
+        return False, "busy", f"设备忙（{cur.get('command')}），请排队或稍后重试"
+    if cur_state == "LISTENING" and command.startswith("audio.play"):
+        return False, "busy", "正在录音，禁止同时播放（避免自触发）"
+    if cur_state == "SPEAKING" and command.startswith("audio.capture"):
+        return False, "busy", "正在播放，禁止同时录音（避免自触发）"
+    return True, "ok", ""
+
+
+# ---------- WS 控制指令层（板端统一 JSON 命令入口）----------
+CMD_PENDING = {}    # request_id -> {"event": Event, "result": dict}
+CMD_SENT = {}       # request_id -> {device_id, command, t}：async 指令的发出记录。
+                    # async 不等回执，但板子照样会回 command_result；留着这条，
+                    # 迟到的回执才能对上号（判失败 + 记账），顺带清掉过期条目。
+CMD_SENT_TTL_S = 60.0
+
+
+def _cmd_sent_gc():
+    """清掉过期的 async 发送记录（WS 断连/板子不回时不会无限堆积）。"""
+    now = time.time()
+    with DEV_LOCK:
+        for rid in [r for r, v in CMD_SENT.items() if now - v.get("t", 0) > CMD_SENT_TTL_S]:
+            CMD_SENT.pop(rid, None)
+
+
+def ws_on_command_result(j):
+    """板子回执：{"type":"command_result","request_id":...,"ok":...,"error":{...}}
+
+    sync 指令：唤醒等待方。async 指令没有等待方，靠 CMD_SENT 对上号并记一次账——
+    否则板子回的 400/409 会被静默丢掉，面板上完全看不出"指令其实被拒了"。
+    """
+    rid = j.get("request_id")
+    if not rid:
+        return
+    with DEV_LOCK:
+        p = CMD_PENDING.get(rid)
+    if p:
+        p["result"] = j
+        p["event"].set()
+        print(f"[ws<-] command_result rid={rid} ok={j.get('ok')} "
+              f"status={j.get('status') or (j.get('data') or {}).get('status')} "
+              f"error={j.get('error')}", flush=True)
+    else:
+        with DEV_LOCK:
+            rec = CMD_SENT.pop(rid, None)
+        # quiet 的指令（步态帧）成功时不打日志：8Hz × 全天会把日志冲爆。
+        # 失败仍然要打——板端拒了命令却一声不吭，才是最难受的。
+        if j.get("ok") and rec and rec.get("quiet"):
+            return
+        who = f" device={rec.get('device_id')} cmd={rec.get('command')}" if rec else ""
+        print(f"[ws<-] command_result rid={rid}{who}（async，无等待方）"
+              f"ok={j.get('ok')}", flush=True)
+    if not j.get("ok"):
+        err = j.get("error") or {}
+        print(f"[cmd] 回执失败 rid={rid} code={err.get('code')} "
+              f"message={err.get('message')}", flush=True)
+
+
+def ws_command(device_id, command, args=None, mode="async", policy="queue", timeout=5.0,
+               quiet=False):
+    """通过已绑定的音频 WS 下发一条 JSON 控制指令。
+    mode=async 只确认送达；mode=sync 等板子的 command_result 回执。
+    quiet=True 不打逐帧日志（步态 8Hz 下发，逐帧打会把日志冲爆）；失败照打。"""
+    ws = dev_get_ws(device_id)
+    if ws is None:
+        return {"ok": False, "error": "设备离线：无音频 WS 连接（板子需先连 ?role=dog 并发 hello）"}
+    rid = _ctrl_gen_id()
+    env = {"type": "command", "version": 1, "request_id": rid,
+           "command": command, "mode": mode, "policy": policy, "args": args or {}}
+    ev = threading.Event()
+    with DEV_LOCK:
+        CMD_PENDING[rid] = {"event": ev, "result": None}
+    payload = json.dumps(env, ensure_ascii=False)
+    if not _ws_call(lambda: ws.send(payload)):
+        with DEV_LOCK:
+            CMD_PENDING.pop(rid, None)
+        print(f"[ws->] 发送失败 device={device_id} {command} rid={rid}", flush=True)
+        return {"ok": False, "error": "ws send failed", "request_id": rid}
+    if not quiet:
+        print(f"[ws->] {device_id} <- {command} rid={rid} mode={mode} policy={policy} "
+              f"args={json.dumps(args or {}, ensure_ascii=False)}", flush=True)
+    if mode != "sync":
+        # async 不等回执：立刻注销等待方（否则迟到的回执只写不删，字典会越攒越大），
+        # 改为在 CMD_SENT 记一笔，让板子稍后回的结果还能对上号、能判失败。
+        with DEV_LOCK:
+            CMD_PENDING.pop(rid, None)
+            CMD_SENT[rid] = {"device_id": device_id, "command": command,
+                             "t": time.time(), "quiet": quiet}
+        _cmd_sent_gc()
+        return {"ok": True, "request_id": rid, "sent": env, "note": "async 已送达"}
+    if not ev.wait(timeout):
+        with DEV_LOCK:
+            CMD_PENDING.pop(rid, None)
+        return {"ok": False, "error": f"timeout: 板子未在 {timeout}s 内回 command_result",
+                "request_id": rid}
+    with DEV_LOCK:
+        res = CMD_PENDING.pop(rid, {}).get("result") or {}
+    okb = bool(res.get("ok"))
+    out = {"ok": okb, "request_id": rid, "result": res}
+    if not okb:
+        # 把板端的 error.code/message 抬到顶层：上层（大脑层补话、调试台）才能说清"为什么没做成"
+        err = res.get("error") or {}
+        code = err.get("code") or "ERROR"
+        out["error"] = f"板端拒绝 {code}：{err.get('message') or ''}".strip("： ")
+        out["error_code"] = code
+        out["retryable"] = err.get("retryable")
+    return out
+
+
+# ---------- 优先级调度（服务端门禁 + 板端 policy）----------
+def _command_hold_ms(command, args):
+    """这条命令预计要占设备多久（毫秒）。None = 用 ACTION_TTL_S 兜底。
+
+    板端不发周期 state 上报、也没有动作完成事件，所以服务端只能自己估：
+    估短了会让长动作被误判为空闲，估长了会让设备白白锁住。宁可略长一点。
+    """
+    args = args or {}
+    if command == "servo.move":
+        servos = args.get("servos") or []
+        slowest = 0
+        for s in servos:
+            try:
+                slowest = max(slowest, int(s.get("time") or 0))
+            except (TypeError, ValueError):
+                continue
+        return slowest + 300
+    if command == "servo.unload":
+        return 300
+    if command == "sequence.run" and twin_mod is not None:
+        steps = args.get("steps") or []
+        if steps:
+            return twin_mod.sequence_duration_ms(steps) + 500
+    if command == "action.run":
+        return None            # 预存动作组时长未知，用默认 TTL
+    return None
+
+
+def servo_dispatch(device_id, command, args=None, priority=None, policy=None,
+                   protect=False, mode=None):
+    """优先级调度：服务端门禁 -> 抢占/保护 -> WS 下发。
+
+    policy 取板端协议默认值 COMMAND_POLICY，缺省时按优先级推导（P0~P2 interrupt，其余 queue）。
+    mode 取 COMMAND_MODE，缺省 sync。只读命令不占用设备（不写 DEV_CURRENT / 不置 MOVING）。
+    """
+    prio = int(priority) if priority is not None else SERVO_PRIORITY.get(command, 3)
+    pol = policy or COMMAND_POLICY.get(command) or ("interrupt" if prio <= 2 else "queue")
+    md = mode or COMMAND_MODE.get(command, "sync")
+    ok, reason, hint = dev_gate(device_id, command, policy=pol)
+    if not ok:
+        return {"ok": False, "error": reason, "hint": hint, "priority": prio}
+    # 只读查询 / 设备级 / 表情：不占用设备，不置 MOVING，不会阻塞后续舵机命令
+    readonly = (command in READONLY_COMMANDS
+                or command.startswith("device.")
+                or command == "display.face")
+    if prio <= 1:
+        play_abort(device_id)          # 急停/停止：同时打断语音播放
+        with DEV_LOCK:
+            DEV_CURRENT.pop(device_id, None)
+        dev_set_state(device_id, "IDLE")
+    elif not readonly:
+        with DEV_LOCK:
+            DEV_CURRENT[device_id] = {"command": command, "priority": prio,
+                                      "since": time.time(),
+                                      "hold_ms": _command_hold_ms(command, args),
+                                      "protect": protect or command in PROTECTED_COMMANDS}
+        dev_set_state(device_id, "MOVING")
+    res = ws_command(device_id, command, args or {}, mode=md, policy=pol)
+    res["priority"] = prio
+    res["policy"] = pol
+    res["mode"] = md
+    return res
+
+
+# ---------------------------------------------------------------------------
+# 数字孪生（从板端页面搬到服务端）
+#
+# 原来这层整个活在 main/web_page.h 内嵌的浏览器 JS 里：标定表和动作组存在浏览器
+# 本地存储（换机器即丢、大模型读不到），步态跑 requestAnimationFrame（标签页转后台
+# 就被降到 1Hz），页面直连板端 /api/* 还绕过了这里的鉴权与调度。
+# 现在数据落盘成 twin_store.json，步态变成后台线程，下发统一走上面的 WS 命令层。
+# ---------------------------------------------------------------------------
+try:
+    import twin as twin_mod
+except Exception as _e:  # noqa: BLE001
+    twin_mod = None
+    print(f"[twin] twin.py 加载失败，孪生功能不可用：{_e}", flush=True)
+
+TWIN_GAIT = None
+TWIN_SEQ = None
+
+
+def _twin_gait_dispatch(device_id, servos, move_ms=None):
+    """步态单帧下发：直接走 WS，绕开 dev_gate。
+
+    步态自己就是设备当前的占用者（DEV_CURRENT 里标着 twin.gait），再走一遍门禁
+    会被自家的 busy 判据挡下。顺便把 since 往前推，免得被 30s 的看门狗当残留清掉。
+    """
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+        if cur and cur.get("command") == "twin.gait":
+            cur["since"] = time.time()
+    return ws_command(device_id, "servo.move", {"servos": servos},
+                      mode="async", policy="interrupt", quiet=True)
+
+
+def _twin_seq_dispatch(device_id, steps):
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+        if cur and cur.get("command") == "twin.sequence":
+            cur["since"] = time.time()
+    return ws_command(device_id, "sequence.run", {"steps": steps},
+                      mode="async", policy="queue", quiet=True)
+
+
+def _twin_seq_on_start(device_id):
+    with DEV_LOCK:
+        DEV_CURRENT[device_id] = {"command": "twin.sequence", "priority": 3,
+                                  "since": time.time(), "protect": True}
+    dev_set_state(device_id, "MOVING")
+
+
+def _twin_seq_on_stop(device_id, reason="user"):
+    if not device_id:
+        return
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+        if cur and cur.get("command") == "twin.sequence":
+            DEV_CURRENT.pop(device_id, None)
+    dev_set_state(device_id, "IDLE")
+
+
+def _twin_gait_on_start(device_id):
+    with DEV_LOCK:
+        DEV_CURRENT[device_id] = {"command": "twin.gait", "priority": 2,
+                                  "since": time.time(), "protect": True}
+    dev_set_state(device_id, "MOVING")
+
+
+def _twin_gait_on_stop(device_id, reason="user"):
+    if not device_id:
+        return
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+        if cur and cur.get("command") == "twin.gait":
+            DEV_CURRENT.pop(device_id, None)
+    dev_set_state(device_id, "IDLE")
+
+
+if twin_mod is not None:
+    TWIN_GAIT = twin_mod.GaitRunner(twin_mod.load, _twin_gait_dispatch,
+                                    on_start=_twin_gait_on_start,
+                                    on_stop=_twin_gait_on_stop)
+    TWIN_SEQ = twin_mod.SequenceLooper(_twin_seq_dispatch,
+                                       on_start=_twin_seq_on_start,
+                                       on_stop=_twin_seq_on_stop)
+
+
+def twin_available():
+    return twin_mod is not None and TWIN_GAIT is not None
+
+
+def twin_stop_all(device_id=None, reason="shutdown"):
+    """停掉该设备（或全部）孪生后台线程。断连/关机时调用。"""
+    if TWIN_GAIT is not None and TWIN_GAIT.is_running(device_id):
+        TWIN_GAIT.stop(reason=reason)
+    if TWIN_SEQ is not None and TWIN_SEQ.is_running(device_id):
+        TWIN_SEQ.stop()
+
+
+def twin_pick_device(explicit=None):
+    """选孪生要控制的设备：显式指定 > 唯一在线的 WS 设备 > DOG_BRAIN_DEVICE。"""
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    with DEV_LOCK:
+        online = sorted(DEV_WS.keys())
+    if len(online) == 1:
+        return online[0]
+    env = (os.environ.get("DOG_BRAIN_DEVICE") or "").strip()
+    if env:
+        return env
+    return online[0] if online else ""
+
+
+def twin_devices():
+    """孪生页面顶栏的设备下拉：列出所有知道的设备 + 是否在线。"""
+    with DEV_LOCK:
+        ids = sorted(set(list(DEV_WS.keys()) + list(DEV_STATE.keys())
+                         + list(DEVICE_ENDPOINTS.keys())))
+        ws_ids = set(DEV_WS.keys())
+    out = []
+    for did in ids:
+        st = dev_get_state(did) or {}
+        out.append({"device_id": did, "online": did in ws_ids,
+                    "state": st.get("state", "OFFLINE"),
+                    "ip": st.get("ip") or (DEVICE_ENDPOINTS.get(did) or {}).get("host")})
+    return out
+
+
+def twin_positions(device_id, ids):
+    """读舵机真实位置：走 WS 命令层（板端 servo.position.read）。"""
+    res = servo_dispatch(device_id, "servo.position.read", {"ids": list(ids)})
+    if not res.get("ok"):
+        return res
+    payload = (res.get("result") or {}).get("result") or {}
+    res["positions"] = payload.get("positions") or []
+    return res
+
+
+def twin_battery(device_id):
+    res = servo_dispatch(device_id, "servo.battery.read", {})
+    if not res.get("ok"):
+        return res
+    payload = (res.get("result") or {}).get("result") or {}
+    res["voltage_mv"] = payload.get("voltage_mv")
+    return res
+
+
+def twin_can_take_over(device_id, self_cmd):
+    """孪生要独占设备（起步态 / 起动作组循环）时的前置检查。
+
+    不能拿 dev_gate("sequence.run") 当代理判据：那条路会被任何一条瞬时命令
+    （刚下发的一次 servo.move）判成 busy，于是"刚调完一个舵机就点开始 trot"
+    会被自家门禁拒掉。这里只在意真正会长时间霸占设备的东西。
+
+    self_cmd 是本次要起的占用名：别人的占用要拒，自己重入交给 runner 自己判。
+    """
+    st = dev_get_state(device_id) or {}
+    if st.get("state") == "UPGRADING":
+        return False, "upgrading", "设备正在 OTA 升级，拒绝一切命令"
+    if dev_get_ws(device_id) is None:
+        return False, "offline", "设备离线：没有音频 WS 连接"
+    _release_stale_action(device_id)
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(device_id)
+    if cur and cur.get("protect") and cur.get("command") != self_cmd:
+        return False, "busy", f"设备正被 {cur.get('command')} 占用，先停掉它"
+    return True, "ok", ""
+
+
+def twin_status_payload():
+    """孪生台一次性拿全：设备列表、目标设备、步态/循环状态、store 元信息。"""
+    store = twin_mod.load() if twin_mod else {}
+    target = twin_pick_device()
+    # 查询前先兜底清理：瞬时命令的占用是按自身时长过期的，gate 只在下发路径上清理，
+    # 不在这里补一次的话，面板会一直显示"设备忙"直到下一次下发（和 dev_state_all 同理）
+    _release_stale_action(target)
+    st = dev_get_state(target) or {}
+    with DEV_LOCK:
+        cur = DEV_CURRENT.get(target)
+    return {
+        "ok": True,
+        "devices": twin_devices(),
+        "target": target,
+        # 目标设备的调度占用与状态：页面据此提示"板子正忙/序列播放中"，
+        # 不用去戳板子（250ms 戳一次会把板端日志和舵机总线都占满）
+        "target_state": st.get("state", "OFFLINE"),
+        "target_busy": bool(cur),
+        "target_current": cur.get("command") if cur else None,
+        "target_playing_sequence": bool(cur and cur.get("command") == "twin.sequence"),
+        "gait": TWIN_GAIT.state() if TWIN_GAIT else {"running": False},
+        "sequence": TWIN_SEQ.state() if TWIN_SEQ else {"running": False},
+        "store_path": twin_mod.STORE_PATH if twin_mod else None,
+        "store_updated_at": store.get("updated_at"),
+        "layout": {"legs": [l["name"] for l in twin_mod.LEGS],
+                   "dof": list(twin_mod.DOF),
+                   "dof_label": list(twin_mod.DOF_LABEL),
+                   "motion_group_count": twin_mod.MOTION_GROUP_COUNT,
+                   "motion_max_steps": twin_mod.MOTION_MAX_STEPS},
+    }
+
+# ---------- WS 下行语音播放 ----------
+def audio_make_packet(opus_bytes):
+    """下行帧头：0x00 0x00 len_hi len_lo + Opus 载荷（与上行格式一致）。"""
+    n = len(opus_bytes)
+    return bytes([0x00, 0x00, (n >> 8) & 0xFF, n & 0xFF]) + opus_bytes
+
+
+def _ws_call(factory, timeout=5):
+    """从工作线程安全地把一帧投到 asyncio 的 WS 连接上。"""
+    if LOOP is None:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(factory(), LOOP).result(timeout)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[ws] 下行发送失败：{e}", flush=True)
+        return False
+
+
+def _ws_send_json(ws, obj):
+    return _ws_call(lambda: ws.send(json.dumps(obj, ensure_ascii=False)))
+
+
+def _beep_pcm():
+    """占位音源：440Hz 提示音 0.6s。TTS 不可用/失败时用它保住播放链路。"""
+    import math
+    n = int(16000 * 0.6)
+    buf = bytearray()
+    for i in range(n):
+        v = int(6000 * math.sin(2 * math.pi * 440 * i / 16000.0)
+                * (0.5 + 0.5 * math.sin(2 * math.pi * 2 * i / 16000.0)))
+        buf += struct.pack("<h", max(-32767, min(32767, v)))
+    return bytes(buf)
+
+
+def synth_speech(text):
+    """可插拔音源：优先 TTS_HOOK，未接或失败则回退提示音。
+
+    TTS_HOOK 契约：fn(text) -> 16000Hz / 单声道 / int16 裸 PCM（不带 WAV 头）。
+    返回空或抛异常一律视作合成失败，回退提示音，避免整条播放链路断掉。
+    """
+    if TTS_HOOK is not None:
+        try:
+            pcm = TTS_HOOK(text) or b""
+        except Exception as e:  # noqa: BLE001
+            print(f"[tts] 合成失败，回退提示音：{e}", flush=True)
+            pcm = b""
+        if pcm:
+            # 契约兜底：必须按 2 字节对齐，否则最后一帧会编码失败
+            if len(pcm) % 2:
+                pcm = pcm[: len(pcm) // 2 * 2]
+            return pcm
+    return _beep_pcm()
+
+
+def _load_tts():
+    """启动时尝试接入 tts_edge（edge-tts）；接不上就继续用提示音，不影响服务启动。"""
+    global TTS_HOOK, TTS_NAME
+    try:
+        import tts_edge
+        TTS_HOOK = tts_edge.synth
+        TTS_NAME = f"edge-tts · {tts_edge.VOICE}"
+        print(f"[tts] 已接入 {TTS_NAME}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[tts] 未接入 edge-tts（{e}），播放继续用提示音占位", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# [C-7] 大脑层：ASR 文本 -> 云端大模型 -> 说话 + 表情 + 动作
+# 默认关闭（设 DOG_BRAIN=1 开启），避免没配 Key 时干扰现有识别流程。
+# ---------------------------------------------------------------------------
+BRAIN = None
+BRAIN_ENABLED = str(os.environ.get("DOG_BRAIN", "0")).lower() not in ("", "0", "false", "no")
+BRAIN_INFO = {"enabled": BRAIN_ENABLED, "ready": False}
+BRAIN_LOCK = threading.Lock()
+
+
+def _device_id_by_ws(ws):
+    """反查某条 WS 属于哪台设备（dog 角色绑定过 DEV_WS）。"""
+    if ws is None:
+        return None
+    with DEV_LOCK:
+        for did, w in DEV_WS.items():
+            if w is ws:
+                return did
+    return None
+
+
+def _brain_action(device_id, action_name):
+    """动作执行回调：把能力清单里的动作名翻译成板端的 command envelope。
+
+    板端只认 action.run 的 args.group（控制板预存动作组编号 0~255），**不认动作名**。
+    所以清单里必须配 args；缺了就当场报错，绝不退回 {"name": ...}——
+    那种信封板端必然判 INVALID_ARGUMENT，狗会"说了做不到"还浑然不觉。
+    """
+    if BRAIN is None:
+        return {"ok": False, "error": "brain not loaded"}
+    for a in BRAIN.caps.get("actions", []):
+        if a.get("name") != action_name:
+            continue
+        cmd = a.get("cmd") or "action.run"
+        args = dict(a.get("args") or {})
+        if not args:
+            return {"ok": False, "name": action_name,
+                    "error": f"动作 {action_name} 没配板端参数",
+                    "hint": '在 dog_actions.json 里补 args，例如 {"group":1,"times":1}'}
+        if cmd == "action.run":
+            if args.get("group") is None:
+                return {"ok": False, "name": action_name,
+                        "error": f"动作 {action_name} 缺 args.group",
+                        "hint": "板端只认预存动作组编号，请填控制板里实际存的组号"}
+            args.setdefault("times", 1)      # 板端 json_get_int_range 里 times 必填，缺了直接 400
+        # 主人说话时下的动作应当直接打断板子正在跑的动作组；
+        # 排队（queue）在板端 sequence 播放期间会被 409 拒掉，狗就只会说话不动
+        policy = a.get("policy") or ("interrupt" if cmd == "action.run" else None)
+        # 必须用 sync：板子会在毫秒级回 command_result，拿到真实成败才能触发"补话"；
+        # 走 async 的话服务端永远只看到"已送达"，狗被 409 拒了还会嘴硬说做完了。
+        return servo_dispatch(device_id, cmd, args, policy=policy, mode="sync")
+    return {"ok": False, "error": "unknown action", "name": action_name}
+
+
+def _load_brain():
+    """启动时装配大脑层。缺 Key / 缺包都只是不启用，不影响服务本身。"""
+    global BRAIN, BRAIN_INFO
+    if not BRAIN_ENABLED:
+        BRAIN_INFO = {"enabled": False, "ready": False,
+                      "reason": "未开启：启动前设 DOG_BRAIN=1"}
+        return
+    try:
+        import brain
+        import llm_cloud
+        BRAIN = brain.DogBrain(actors={"face": face_show,
+                                       "action": _brain_action,
+                                       "speak": audio_play_text})
+        info = llm_cloud.describe()
+        info.update({"enabled": True, "ready": info.get("ready", False),
+                     "actions": BRAIN.action_names(),
+                     "faces": BRAIN.caps.get("faces", [])})
+        BRAIN_INFO = info
+        if info.get("ready"):
+            print(f"[brain] 已启用：{info['provider']} / {info['model']}，"
+                  f"动作 {len(info['actions'])} 个", flush=True)
+        else:
+            print("[brain] 已装载但未配置 Key：设 LLM_PROVIDER / LLM_API_KEY 后重启", flush=True)
+    except Exception as e:  # noqa: BLE001
+        BRAIN = None
+        BRAIN_INFO = {"enabled": True, "ready": False, "error": str(e)}
+        print(f"[brain] 装载失败，对话功能不可用：{e}", flush=True)
+
+
+def _brain_config_dict():
+    """当前大模型配置（含掩码后的 Key，不回显原文）。"""
+    import llm_cloud
+    d = llm_cloud.describe()
+    d["config_file"] = llm_cloud.config_path()
+    return d
+
+
+def _brain_write_config(body):
+    """把配置写进 llm_config.json。llm_cloud 按 mtime 热读，写完下次调用即生效。
+
+    api_key 传空串表示"不改"；换 provider 时若没给 model，就退回该平台的预设默认模型，
+    免得拿 glm 的模型名去打 deepseek。
+    """
+    import llm_cloud
+    path = llm_cloud.config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f) or {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    prov = str(body.get("provider") or "").strip().lower()
+    if prov:
+        cfg["provider"] = prov
+    model = str(body.get("model") or "").strip()
+    if model:
+        cfg["model"] = model
+    elif prov and prov in llm_cloud.PRESETS and cfg.get("provider") != prov:
+        cfg["model"] = llm_cloud.PRESETS[prov]["model"]
+    key = str(body.get("api_key") or "").strip()
+    if key:
+        cfg["api_key"] = key
+    base = str(body.get("base_url") or "").strip()
+    if base:
+        cfg["base_url"] = base
+    elif prov and prov != "custom":
+        cfg.pop("base_url", None)      # 交给平台预设，避免残留旧端点
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return _brain_config_dict()
+
+
+def _brain_ping():
+    """连通自检：不带工具问一句，验证 Key / 端点 / 模型名。"""
+    if BRAIN is None:
+        return {"ok": False, "error": "brain 未启用（启动时设 DOG_BRAIN=1）"}
+    return BRAIN.probe()
+
+
+def _brain_dry_run(device_id, text):
+    """预演：走完整决策链路但不下发任何动作/播报，用于调试台看模型到底给了什么。"""
+    if BRAIN is None:
+        return {"ok": False, "error": "brain 未启用（启动时设 DOG_BRAIN=1）"}
+    return BRAIN.handle(device_id, text, dry=True)
+
+
+def brain_say(device_id, text, wait=False):
+    """把一句话交给大脑。默认后台线程执行，避免阻塞 ASR 队列。"""
+    if BRAIN is None:
+        return {"ok": False, "error": "brain 未启用（DOG_BRAIN=1 且配好 LLM_API_KEY）"}
+    # 实时读配置：llm_config.json 改完立刻生效，不用重启服务
+    try:
+        import llm_cloud
+        cfg = llm_cloud.describe()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"配置读取失败：{e}"}
+    if not cfg.get("ready"):
+        return {"ok": False,
+                "error": "大模型未就绪：把 api_key 填进 server/llm_config.json（或设 LLM_API_KEY）",
+                "config": {k: cfg.get(k) for k in ("provider", "base_url", "model", "key_set")},
+                "config_file": llm_cloud.config_path()}
+    if wait:
+        return BRAIN.handle(device_id, text)
+    threading.Thread(target=BRAIN.handle, args=(device_id, text),
+                     daemon=True, name="brain").start()
+    return {"ok": True, "async": True}
+
+
+def audio_play_text(device_id, text):
+    """入队一段待播语音；不忙则立即起播。入队前先过门禁，避免放行后才被拒。"""
+    ok, reason, hint = dev_gate(device_id, "audio.play.start")
+    if not ok:
+        return {"ok": False, "error": reason, "hint": hint}
+    item = {"id": _ctrl_gen_id(), "text": text}
+    with DEV_LOCK:
+        PLAY_QUEUE.setdefault(device_id, []).append(item)
+        busy = device_id in PLAY_CURRENT
+        pos = len(PLAY_QUEUE[device_id])
+    if not busy:
+        _play_next(device_id)
+    return {"ok": True, "id": item["id"], "position": pos}
+
+
+def _play_next(device_id):
+    with DEV_LOCK:
+        if device_id in PLAY_CURRENT:
+            return
+        q = PLAY_QUEUE.get(device_id) or []
+        if not q:
+            return
+        item = q.pop(0)
+        ev = threading.Event()
+        th = threading.Thread(target=_play_worker, args=(device_id, item, ev), daemon=True)
+        PLAY_CURRENT[device_id] = {"id": item["id"], "abort": ev, "thread": th}
+    th.start()
+
+
+def _play_worker(device_id, item, abort):
+    ws = dev_get_ws(device_id)
+    if ws is None:
+        print(f"[play] {device_id} 无音频 WS 连接，丢弃一条播放", flush=True)
+        with DEV_LOCK:
+            PLAY_CURRENT.pop(device_id, None)
+        return
+    ok, reason, hint = dev_gate(device_id, "audio.play.start")
+    if not ok:
+        print(f"[play] 被门禁拒绝：{reason} {hint}", flush=True)
+        with DEV_LOCK:
+            PLAY_CURRENT.pop(device_id, None)
+        return
+    sid = (DEV_STATE.get(device_id) or {}).get("session_id") or ""
+    sr, fd = 16000, 60
+    samples = sr * fd // 1000
+    # 先把音频合成出来再发 start：TTS 可能要 1~3 秒，
+    # 否则板子会处在“已通知开始播放、却没有数据”的空窗状态。
+    t0 = time.time()
+    pcm = synth_speech(item.get("text", ""))
+    print(f"[play] 合成完成 {len(pcm)/2/sr:.2f}s 音频，耗时 {time.time()-t0:.2f}s", flush=True)
+    dev_set_state(device_id, "SPEAKING")
+    _ws_send_json(ws, {"session_id": sid, "type": "audio_play", "state": "start",
+                       "audio_params": {"format": "opus", "sample_rate": sr,
+                                        "channels": 1, "frame_duration": fd}})
+    print(f"[play] 开始下行播放 {item['id']}：{item.get('text', '')[:30]!r}", flush=True)
+    if _OPUS_ENCODER is None:
+        print("[play] 无 OPUS 编码器，跳过音频帧", flush=True)
+    else:
+        enc = _OPUS_ENCODER(sr, 1, "voip")
+        off, total = 0, len(pcm)
+        while off + samples * 2 <= total:
+            if abort.is_set():
+                break
+            chunk = pcm[off: off + samples * 2]
+            off += samples * 2
+            try:
+                opus = enc.encode(bytes(chunk), samples)
+            except Exception as e:  # noqa: BLE001
+                print(f"[play] 编码失败：{e}", flush=True)
+                break
+            pkt = audio_make_packet(opus)
+            if not _ws_call(lambda p=pkt: ws.send(p)):
+                break
+            if abort.wait(fd / 1000.0):     # 严格 60ms 节奏，不突发
+                break
+    _ws_send_json(ws, {"session_id": sid, "type": "audio_play", "state": "stop"})
+    with DEV_LOCK:
+        PLAY_CURRENT.pop(device_id, None)
+    cur = dev_get_state(device_id) or {}
+    if cur.get("state") == "SPEAKING":
+        dev_set_state(device_id, "IDLE")
+    print(f"[play] 播放结束 {item['id']}", flush=True)
+    _play_next(device_id)
+
+
+def play_abort(device_id):
+    """强制打断：立即停当前播放 + 清空队列（急停也走这里）。"""
+    with DEV_LOCK:
+        cur = PLAY_CURRENT.get(device_id)
+        PLAY_QUEUE[device_id] = []
+        if cur:
+            cur["abort"].set()
+    if cur:
+        ws = dev_get_ws(device_id)
+        if ws is not None:
+            sid = (DEV_STATE.get(device_id) or {}).get("session_id") or ""
+            _ws_send_json(ws, {"session_id": sid, "type": "audio_play", "state": "stop"})
+        cur_state = dev_get_state(device_id) or {}
+        if cur_state.get("state") == "SPEAKING":
+            dev_set_state(device_id, "IDLE")
+    return {"ok": True, "aborted": bool(cur)}
+
+
+# ---------- 表情 ----------
+def face_show(device_id, name, duration_ms=None):
+    if name not in FACES:
+        return {"ok": False, "error": "unknown face", "allowed": list(FACES)}
+    dur = int(duration_ms or FACE_DEFAULT_MS)
+    ok, reason, hint = dev_gate(device_id, "display.face")
+    if not ok:
+        return {"ok": False, "error": reason, "hint": hint}
+    res = ws_command(device_id, "display.face", {"name": name, "duration_ms": dur},
+                     mode=COMMAND_MODE.get("display.face", "async"),      # 协议示例为 async
+                     policy=COMMAND_POLICY.get("display.face", "queue"))
+    res["face"] = name
+    return res
+
+
+# ---------- OTA 两阶段握手 ----------
+def _lan_ip():
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:  # noqa: BLE001
+        return "127.0.0.1"
+
+
+def _latest_version():
+    latest = FIRMWARE.get("__latest__")
+    return (latest or {}).get("version") if isinstance(latest, dict) else latest
+
+
+def ota_start(device_id, version=None, url=None):
+    """触发 OTA。板端目前是预留实现（回 NOT_IMPLEMENTED 属正常），服务端同步预留。
+    OTA 期间服务端门禁会拒绝一切其他命令。"""
+    ver = version or _latest_version()
+    fw = FIRMWARE.get(ver) if ver else None
+    args = {"version": ver}
+    if url:
+        args["url"] = url
+    elif fw:
+        args.update({"url": f"http://{_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
+                     "size": fw.get("size"), "sha256": fw.get("sha256")})
+    dev_set_state(device_id, "UPGRADING")
+    with DEV_LOCK:
+        OTA_SESSION[device_id] = {"phase": "preparing", "version": ver, "since": time.time()}
+    res = ws_command(device_id, "ota.start", args, mode="sync", policy="interrupt")
+    with DEV_LOCK:
+        s = OTA_SESSION.get(device_id) or {}
+        s["phase"] = "downloading" if res.get("ok") else "failed"
+        OTA_SESSION[device_id] = s
+    res["phase"] = s["phase"]
+    if not res.get("ok"):
+        dev_set_state(device_id, "ERROR")
+    return res
+
+
+def ota_status(device_id):
+    """查询板端 OTA 状态（预留）。"""
+    return ws_command(device_id, "ota.status", {}, mode="sync", policy="queue")
+
+
+def ota_ready(device_id, version=None):
+    """阶段二：板子报“就绪”，服务端在响应体里直接返回下载地址。"""
+    ver = (version or (OTA_SESSION.get(device_id) or {}).get("version")
+           or _latest_version())
+    fw = FIRMWARE.get(ver)
+    if not fw:
+        return {"ok": False, "error": "firmware not found", "version": ver}
+    with DEV_LOCK:
+        s = OTA_SESSION.get(device_id) or {}
+        s.update({"phase": "downloading", "version": ver, "since": time.time()})
+        OTA_SESSION[device_id] = s
+    dev_set_state(device_id, "UPGRADING")
+    return {"ok": True, "phase": "downloading", "version": ver,
+            "url": f"http://{_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
+            "size": fw.get("size"), "sha256": fw.get("sha256")}
+
+
+def ota_finish(device_id, ok=True, version=None, note=""):
+    with DEV_LOCK:
+        s = OTA_SESSION.get(device_id) or {}
+        s.update({"phase": "succeeded" if ok else "failed", "note": note,
+                  "since": time.time()})
+        OTA_SESSION[device_id] = s
+    dev_set_state(device_id, "IDLE" if ok else "ERROR")
+    return {"ok": True, "phase": s["phase"], "version": s.get("version")}
+
+# [C-2.5] 设备端点注册表（新版双向架构：服务端主动 POST 到 ESP32 自己的 HTTP 服务 /api/v1/command）
+# device_id -> {"host": str, "port": int, "token": str, "auto": bool, "last_seen": iso}
+# 来源：① 控制台手动登记（POST /api/v1/device-endpoints）；② ESP32 连音频 WS 时自动用源 IP 注册(auto=True)
+DEVICE_ENDPOINTS = {}
+DEVICE_ENDPOINTS_FILE = os.path.join(_SCRIPT_DIR, "device_endpoints.json")
+
+
+def load_device_endpoints():
+    global DEVICE_ENDPOINTS
+    try:
+        if os.path.isfile(DEVICE_ENDPOINTS_FILE):
+            with open(DEVICE_ENDPOINTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                DEVICE_ENDPOINTS = {k: v for k, v in data.items() if isinstance(v, dict)}
+                print(f"[ctrl] 已加载 {len(DEVICE_ENDPOINTS)} 条设备端点（{DEVICE_ENDPOINTS_FILE}）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ctrl] 设备端点加载失败：{e}")
+
+
+def save_device_endpoints():
+    try:
+        with open(DEVICE_ENDPOINTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEVICE_ENDPOINTS, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ctrl] 设备端点保存失败：{e}")
+
+
+def device_endpoint_register(device_id, host, port=80, token="", auto=True, overwrite=False):
+    """登记/更新设备端点。auto=True 为 WS 自动注册，默认不覆盖用户手动登记(overwrite=False)。"""
+    if not device_id or not host:
+        return False
+    cur = DEVICE_ENDPOINTS.get(device_id)
+    if cur and cur.get("auto") is False and not overwrite:
+        return False  # 手动登记优先，自动注册不覆盖
+    DEVICE_ENDPOINTS[device_id] = {
+        "host": host, "port": int(port or 80), "token": token or "",
+        "auto": bool(auto), "last_seen": _ctrl_now_iso(),
+    }
+    save_device_endpoints()
+    return True
+
+
+def device_send_command(device_id, command, args=None):
+    """服务端作为 HTTP 客户端，主动 POST 到 ESP32 的 /api/v1/command（新双向架构）。
+    返回 (ok, payload, status_code)。payload 为 ESP32 的 JSON 回复或错误信息。"""
+    import urllib.request
+    ep = DEVICE_ENDPOINTS.get(device_id)
+    if not ep:
+        return False, {"error": "no endpoint for device_id（请先在控制台登记设备端点，或让设备先连音频 WS 由源 IP 自动注册）"}, 0
+    url = f"http://{ep['host']}:{ep['port']}/api/v1/command"
+    envelope = {
+        "version": 1,
+        "request_id": _ctrl_gen_id(),
+        "command": command,
+        "args": args or {},
+    }
+    data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if ep.get("token"):
+        headers["Authorization"] = "Bearer " + ep["token"]
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {"raw": body}
+            return True, payload, resp.status
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace") if hasattr(e, "read") else str(e)
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {"raw": body}
+        return False, payload, e.code
+    except Exception as e:  # noqa: BLE001
+        return False, {"error": f"{type(e).__name__}: {e}"}, 0
+_CTRL_SEQ = 0
+
+
+def _ctrl_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ctrl_gen_id():
+    global _CTRL_SEQ
+    _CTRL_SEQ += 1
+    return ("cmd-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            + "-" + f"{_CTRL_SEQ:06d}")
+
+
+def _ctrl_lan_ip():
+    ips = local_ips()
+    return ips[0] if ips else "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# [C-2] 加载器：固件索引 / 设备 token（main() 启动时调用一次）
+# ---------------------------------------------------------------------------
+def load_firmware_index():
+    """扫描 firmware/esp32s3/<version>/app.bin，计算 size 与 sha256 建立固件表。
+    可选 firmware/firmware.json: {"latest":"1.0.1"} 指明最新版本（缺省取最大版本号）。"""
+    import hashlib
+    FIRMWARE.clear()
+    os.makedirs(os.path.join(FIRMWARE_DIR, "esp32s3"), exist_ok=True)
+    fw_root = os.path.join(FIRMWARE_DIR, "esp32s3")
+    for name in sorted(os.listdir(fw_root)):
+        vdir = os.path.join(fw_root, name)
+        binp = os.path.join(vdir, "app.bin")
+        if os.path.isfile(binp):
+            size = os.path.getsize(binp)
+            h = hashlib.sha256()
+            with open(binp, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            FIRMWARE[name] = {"device": "esp32s3n16r8", "version": name,
+                              "path": binp, "size": size, "sha256": h.hexdigest()}
+    latest = None
+    fj = os.path.join(FIRMWARE_DIR, "firmware.json")
+    if os.path.isfile(fj):
+        try:
+            with open(fj, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            latest = meta.get("latest")
+        except Exception:  # noqa: BLE001
+            pass
+    if not latest or latest not in FIRMWARE:
+        vers = sorted(FIRMWARE.keys())
+        latest = vers[-1] if vers else None
+    FIRMWARE["__latest__"] = latest
+    print(f"[ctrl] 固件表已载入：{len([k for k in FIRMWARE if k != '__latest__'])} 个版本，latest={latest}")
+
+
+def load_device_tokens():
+    """载入设备 token 表（{device_id: token}）。不指定文件则开发模式（接受任意 token）。"""
+    global DEVICE_TOKENS
+    DEVICE_TOKENS = {}
+    if not DEVICE_TOKENS_FILE:
+        return
+    try:
+        with open(DEVICE_TOKENS_FILE, "r", encoding="utf-8") as f:
+            DEVICE_TOKENS = json.load(f)
+        print(f"[ctrl] 已载入 {len(DEVICE_TOKENS)} 个设备 token（来自 {DEVICE_TOKENS_FILE}）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ctrl] 设备 token 文件读取失败：{e}，转为开发模式（接受任意 token）")
+
+
+# ---------------------------------------------------------------------------
+# [C-3] 指令队列：入队（管理端下发）/ 超时扫描（后台线程）
+# 规则：一设备同时仅一个未完成指令；command_id 去重；60s 无状态上报标记超时。
+# ---------------------------------------------------------------------------
+def _ctrl_enqueue(device_id, type_, params):
+    """管理端下发：创建指令并放入设备队列。返回指令 dict；若设备忙（已有未完成指令）返回 None。"""
+    with CTRL_LOCK:
+        if CMD_QUEUES.get(device_id) is not None:
+            return None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        created = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        expires = (now + datetime.timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cmd = {
+            "id": _ctrl_gen_id(), "type": type_, "params": params or {},
+            "created_at": created, "expires_at": expires,
+            "status": "pending", "progress": 0, "message": "", "error_code": None,
+            "device_id": device_id, "_updated": time.time(),
+        }
+        # OTA：若版本在固件表内，自动补全 url / size / sha256
+        if type_ == "ota" and isinstance(params, dict):
+            ver = params.get("version")
+            f = FIRMWARE.get(ver) if ver else None
+            if f:
+                ip = _ctrl_lan_ip()
+                cmd["params"] = {
+                    "version": ver,
+                    "url": f"http://{ip}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
+                    "size": f["size"], "sha256": f["sha256"],
+                }
+        CMD_QUEUES[device_id] = cmd
+        return cmd
+
+
+def _ctrl_timeout_scanner():
+    """后台线程：每 10s 扫描，60s 内无状态更新的未完成指令标记为超时失败。"""
+    while True:
+        time.sleep(10)
+        try:
+            with CTRL_LOCK:
+                for did, cmd in list(CMD_QUEUES.items()):
+                    if cmd is None:
+                        continue
+                    if time.time() - cmd.get("_updated", 0) > 60:
+                        print(f"[ctrl] 指令 {cmd['id']} 设备 {did} 超时（60s 无状态上报）")
+                        cmd["status"] = "failed"
+                        cmd["error_code"] = "CMD_TIMEOUT"
+                        cmd["message"] = "timeout (no status in 60s)"
+                        DEVICES.setdefault(did, {})["last_status"] = dict(cmd)
+                        CMD_QUEUES[did] = None
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ctrl_cmd_public(cmd):
+    """去掉内部字段后返回给设备的指令副本。"""
+    if cmd is None:
+        return None
+    c = dict(cmd)
+    c.pop("_updated", None)
+    return c
+
+
+# ---------------------------------------------------------------------------
+# [C-4] HTTP 路由：ControlHandler（GET/POST 分发 + Bearer 鉴权 + 固件下载）
+# 协议接口见模块 docstring 第 2 项；扩展接口 / 、/ctrl 、/voice 、/api/v1/devices。
+# ---------------------------------------------------------------------------
+class ControlHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "DogCtrl/1.0"
+
+    def log_message(self, fmt, *args):
+        try:
+            print(f"[ctrl] {self.address_string()} - {fmt % args}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- 响应辅助 ----
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text, code=200, ctype="text/plain; charset=utf-8"):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n <= 0:
+                return {}
+            raw = self.rfile.read(n)
+            return json.loads(raw.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _auth_ok(self, device_id=None):
+        """鉴权：解析 Authorization: Bearer <token>。
+        开发模式（未配置 token 表）接受任意非空 token；生产模式按 device_id 严格比对。"""
+        auth = self.headers.get("Authorization", "")
+        token = ""
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+        if not token:
+            return False
+        if not DEVICE_TOKENS:
+            return True
+        if device_id is None:
+            return token in DEVICE_TOKENS.values()  # 管理类端点：任意已知 token 即可
+        return DEVICE_TOKENS.get(device_id) == token
+
+    def _send_file(self, path, size):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def _serve_html(self, path=None):
+        path = path or CTRL_HTML
+        name = os.path.basename(path)
+        if not os.path.isfile(path):
+            return self._send_text(f"{name} 不存在（请将页面放到脚本同目录）", 404)
+        with open(path, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- 入口 ----
+    def do_GET(self):
+        try:
+            self._route("GET")
+        except Exception as e:  # noqa: BLE001
+            self._send_json({"ok": False, "error": str(e)}, 500)
+
+    def do_POST(self):
+        try:
+            self._route("POST")
+        except Exception as e:  # noqa: BLE001
+            self._send_json({"ok": False, "error": str(e)}, 500)
+
+    def do_DELETE(self):
+        try:
+            self._route("DELETE")
+        except Exception as e:  # noqa: BLE001
+            self._send_json({"ok": False, "error": str(e)}, 500)
+
+    def _route(self, method):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        parts = [p for p in path.split("/") if p != ""]
+        # ===================== DELETE =====================
+        if method == "DELETE":
+            # /api/v1/device-endpoints/{id}
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "device-endpoints"):
+                did = parts[3]
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                DEVICE_ENDPOINTS.pop(did, None)
+                save_device_endpoints()
+                return self._send_json({"ok": True, "endpoints": DEVICE_ENDPOINTS})
+            return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+        # ===================== GET =====================
+        if method == "GET":
+            if path == "/health":
+                return self._send_json({"ok": True})
+            # 前端自动识别实际端口（HTTP 控制端口 / WS 语音端口 / 模型状态），避免写死
+            if path == "/api/v1/info":
+                return self._send_json({
+                    "ok": True,
+                    "http_port": CTRL_PORT,
+                    "ws_port": PORT,
+                    "model": ASR_INFO,
+                    "presets": {"http": [8000, 8001], "ws": [8765, 8766]},
+                    "device_endpoints": DEVICE_ENDPOINTS,
+                    "tts": TTS_NAME,
+                    "brain": BRAIN_INFO,
+                })
+            # PC 语音输入运行时开关（仅限本机访问，无需 token）
+            #   GET /pc-input/status  查看当前状态
+            #   GET /pc-input/on      开启：识别结果 -> 剪贴板 -> Ctrl+V 粘贴到焦点窗口
+            #   GET /pc-input/off     关闭：恢复为纯监测，不往电脑输入文字
+            if path == "/pc-input" or path.startswith("/pc-input/"):
+                global PC_INPUT
+                host = self.client_address[0] if isinstance(self.client_address, tuple) else ""
+                if host not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                    return self._send_json({"ok": False, "error": "localhost only"}, 403)
+                sub = path[len("/pc-input"):].strip("/")
+                if sub in ("", "status"):
+                    return self._send_json({"ok": True, "enabled": PC_INPUT,
+                                            "confirm": PC_INPUT_CONFIRM,
+                                            "usage": "GET /pc-input/on 开启 · /pc-input/off 关闭"})
+                if sub == "on":
+                    PC_INPUT = True
+                    print("[pc-input] 已开启：识别结果将粘贴到当前焦点窗口")
+                    return self._send_json({"ok": True, "enabled": True,
+                                            "confirm": PC_INPUT_CONFIRM})
+                if sub == "off":
+                    PC_INPUT = False
+                    pending_pc_input.clear()
+                    print("[pc-input] 已关闭：恢复为纯监测模式")
+                    return self._send_json({"ok": True, "enabled": False})
+                return self._send_json({"ok": False, "error": f"unknown action: {sub}"}, 404)
+            # 管理：设备列表（含当前指令）
+            # 大脑层状态：模型平台 / 是否配好 Key / 当前动作清单
+            if path == "/api/v1/brain/status":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                info = dict(BRAIN_INFO)
+                try:                       # 实时反映 llm_config.json 的最新内容
+                    import llm_cloud
+                    info.update(llm_cloud.describe())
+                    info["config_file"] = llm_cloud.config_path()
+                except Exception:  # noqa: BLE001
+                    pass
+                if BRAIN is not None:
+                    info["persona"] = BRAIN.caps.get("persona", "")
+                    info["max_reply_chars"] = BRAIN.caps.get("max_reply_chars", 30)
+                return self._send_json({"ok": True, "brain": info})
+            # 调试台：读写大模型配置（provider / model / key），写完热生效
+            if path == "/api/v1/brain/config":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                try:
+                    return self._send_json({"ok": True, "config": _brain_config_dict()})
+                except Exception as e:  # noqa: BLE001
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
+            # 调试台：能力清单原文（persona / rules / actions / faces）
+            if path == "/api/v1/brain/caps":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                try:
+                    with open(os.path.join(_SCRIPT_DIR, "dog_actions.json"),
+                              "r", encoding="utf-8") as f:
+                        caps = json.load(f)
+                    return self._send_json({"ok": True, "caps": caps,
+                                            "file": os.path.join(_SCRIPT_DIR,
+                                                                 "dog_actions.json")})
+                except Exception as e:  # noqa: BLE001
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
+            # 调试台：某个设备的对话历史（模型串味时看这里）
+            if path == "/api/v1/brain/history":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                q = urllib.parse.parse_qs(parsed.query or "")
+                did = (q.get("device_id") or [""])[0].strip()
+                if BRAIN is None:
+                    return self._send_json({"ok": False, "error": "brain 未启用"}, 503)
+                return self._send_json({"ok": True, "device_id": did,
+                                        "history": BRAIN.history(did)})
+            if path == "/api/v1/devices":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                with CTRL_LOCK:
+                    devs_map = {did: dict(d) for did, d in DEVICES.items()}
+                # 新架构下板子走 WebSocket（?role=dog）而不再发 HTTP 心跳，
+                # 仅看 DEVICES 会让这张表永远为空；这里把 WS 侧登记过的设备一并合并。
+                for did in dev_state_all():
+                    st = dev_get_state(did) or {}
+                    cur = DEV_CURRENT.get(did) or {}
+                    online = bool(st.get("ws_alive"))
+                    row = devs_map.setdefault(did, {})
+                    row["ip"] = st.get("ip") or row.get("ip")
+                    row.setdefault("rssi", None)
+                    row.setdefault("free_heap", None)
+                    row["online"] = online
+                    row["state"] = st.get("state", "OFFLINE")
+                    row["age"] = st.get("age")
+                    row["source"] = "ws" if (online or st.get("session_id")) else row.get("source", "endpoint")
+                    row["last_heartbeat"] = st.get("last_seen", row.get("last_heartbeat"))
+                    row["busy"] = bool(row.get("busy") or cur)
+                    row["running_slot"] = cur.get("command", row.get("running_slot"))
+                devs = []
+                for did, d in sorted(devs_map.items()):
+                    c = CMD_QUEUES.get(did)
+                    devs.append({"device_id": did, **d, "command": _ctrl_cmd_public(c)})
+                return self._send_json({"ok": True, "devices": devs})
+            # 固件 latest
+            if path == "/api/v1/firmware/esp32s3/latest":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                latest = FIRMWARE.get("__latest__")
+                if not latest or latest not in FIRMWARE:
+                    return self._send_json({"ok": False, "error": "no firmware"}, 404)
+                f = FIRMWARE[latest]
+                return self._send_json({"ok": True, "device": f["device"], "version": f["version"],
+                                        "url": f"http://{_ctrl_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{latest}/app.bin",
+                                        "size": f["size"], "sha256": f["sha256"]})
+            # 固件版本列表
+            if path == "/api/v1/firmware/esp32s3":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                vers = [FIRMWARE[k] for k in FIRMWARE if k != "__latest__"]
+                return self._send_json({"ok": True, "latest": FIRMWARE.get("__latest__"),
+                                        "versions": vers})
+            # 设备端点注册表（新版双向架构：服务端直推 ESP32）
+            if path == "/api/v1/devices/state":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                return self._send_json({
+                    "ok": True, "devices": dev_state_all(),
+                    "states": list(DEV_STATES), "faces": list(FACES),
+                    "queue": {d: len(q) for d, q in PLAY_QUEUE.items() if q},
+                    "current": DEV_CURRENT, "ota": OTA_SESSION})
+
+            if path == "/api/v1/device-endpoints":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                return self._send_json({"ok": True, "endpoints": DEVICE_ENDPOINTS})
+            # /api/v1/devices/{did}/commands/next
+            if (len(parts) == 6 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "devices" and parts[4] == "commands" and parts[5] == "next"):
+                did = parts[3]
+                if not self._auth_ok(did):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                with CTRL_LOCK:
+                    cmd = CMD_QUEUES.get(did)
+                    if cmd is not None and cmd.get("status") == "pending":
+                        c = _ctrl_cmd_public(cmd)
+                        CMD_QUEUES[did] = dict(cmd, status="accepted", _updated=time.time())
+                        return self._send_json({"ok": True, "command": c}, 200)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # /firmware/esp32s3/{version}/app.bin
+            if (len(parts) == 4 and parts[0] == "firmware" and parts[1] == "esp32s3"
+                    and parts[3] == "app.bin"):
+                ver = parts[2]
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                f = FIRMWARE.get(ver)
+                if not f or not os.path.isfile(f["path"]):
+                    return self._send_json({"ok": False, "error": "firmware not found"}, 404)
+                return self._send_file(f["path"], f["size"])
+            # ===== 数字孪生主控台（从板端页面搬到服务端）=====
+            if path.startswith("/api/v1/twin/"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                if not twin_available():
+                    return self._send_json(
+                        {"ok": False, "error": "twin.py 未加载，孪生功能不可用"}, 503)
+                q = urllib.parse.parse_qs(parsed.query)
+                did = twin_pick_device(q.get("device_id", [""])[0])
+
+                if path == "/api/v1/twin/store":
+                    return self._send_json({"ok": True, "store": twin_mod.load(),
+                                            "store_path": twin_mod.STORE_PATH})
+                if path == "/api/v1/twin/status":
+                    return self._send_json(twin_status_payload())
+                if path == "/api/v1/twin/gait":
+                    return self._send_json({"ok": True, "gait": TWIN_GAIT.state(),
+                                            "sequence": TWIN_SEQ.state()})
+                if path == "/api/v1/twin/servo/pos":
+                    ids = [int(x) for x in re.findall(r"\d+", q.get("ids", [""])[0])
+                           if 0 < int(x) < 254][:32]
+                    if not ids:
+                        return self._send_json({"ok": False, "error": "ids 必填"}, 400)
+                    if not did:
+                        return self._send_json({"ok": False, "error": "没有可用设备"}, 409)
+                    r = twin_positions(did, ids)
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+                if path == "/api/v1/twin/battery":
+                    if not did:
+                        return self._send_json({"ok": False, "error": "没有可用设备"}, 409)
+                    r = twin_battery(did)
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+                return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+            # 聚合首页 / 管理页 / 语音监测台
+            if path in ("/", "/portal", "/portal.html"):
+                return self._serve_html(PORTAL_HTML)
+            if path in ("/ctrl", "/ctrl.html", "/index_ctrl.html"):
+                return self._serve_html(CTRL_HTML)
+            if path in ("/brain", "/brain.html"):
+                return self._serve_html(BRAIN_HTML)
+            if path in ("/twin", "/twin.html"):
+                return self._serve_html(TWIN_HTML)
+            if path in ("/voice", "/voice.html", "/index.html"):
+                return self._serve_html(INDEX_HTML)
+            return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+        # ===================== POST =====================
+        if method == "POST":
+            # /api/v1/brain/say —— 对话入口：不用板端说话也能验证整条链路
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "say"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json() or {}
+                did = (body.get("device_id") or os.environ.get("DOG_BRAIN_DEVICE") or "").strip()
+                text = (body.get("text") or "").strip()
+                if not did:
+                    return self._send_json({"ok": False,
+                                            "error": "device_id 必填（或设 DOG_BRAIN_DEVICE）"}, 400)
+                if not text:
+                    return self._send_json({"ok": False, "error": "text 必填"}, 400)
+                res = brain_say(did, text, wait=bool(body.get("wait")))
+                res.update({"device_id": did, "text": text})
+                return self._send_json(res, 200 if res.get("ok") else 503)
+            # 调试台：预演一句话（走完整决策但不下发动作/播报）
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "test"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json() or {}
+                did = (body.get("device_id") or os.environ.get("DOG_BRAIN_DEVICE")
+                       or "debug").strip()
+                text = (body.get("text") or "").strip()
+                if not text:
+                    return self._send_json({"ok": False, "error": "text 必填"}, 400)
+                res = _brain_dry_run(did, text)
+                res.update({"device_id": did, "text": text})
+                return self._send_json(res, 200 if res.get("ok") else 503)
+            # 调试台：保存大模型配置（写 llm_config.json，免重启）
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "config"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json() or {}
+                try:
+                    cfg = _brain_write_config(body)
+                except Exception as e:  # noqa: BLE001
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
+                if BRAIN is not None:            # 能力清单没变，但配置变了要记一笔
+                    print(f"[brain] 配置已更新：{cfg.get('provider')} / {cfg.get('model')}"
+                          f" ready={cfg.get('ready')}", flush=True)
+                return self._send_json({"ok": True, "config": cfg})
+            # 调试台：连通自检（Key / 端点 / 模型名对不对）
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "ping"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                r = _brain_ping()
+                return self._send_json(r, 200 if r.get("ok") else 503)
+            # 调试台：重读 dog_actions.json（改完动作清单不用重启服务）
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "reload"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                if BRAIN is None:
+                    return self._send_json({"ok": False, "error": "brain 未启用"}, 503)
+                BRAIN.reload()
+                return self._send_json({"ok": True, "actions": BRAIN.action_names(),
+                                        "faces": BRAIN.caps.get("faces", [])})
+            # 调试台：清空某设备的对话历史
+            if (len(parts) == 5 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "brain" and parts[3] == "history"
+                    and parts[4] == "clear"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json() or {}
+                did = str(body.get("device_id") or "").strip()
+                if BRAIN is None:
+                    return self._send_json({"ok": False, "error": "brain 未启用"}, 503)
+                n = BRAIN.clear_history(did)
+                return self._send_json({"ok": True, "cleared": n, "device_id": did})
+            # ===== 数字孪生主控台：写接口（全部转发到 WS 命令层）=====
+            if path.startswith("/api/v1/twin/"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                if not twin_available():
+                    return self._send_json(
+                        {"ok": False, "error": "twin.py 未加载，孪生功能不可用"}, 503)
+                body = self._read_json() or {}
+                did = twin_pick_device(body.get("device_id"))
+
+                # 保存标定 / 几何 / 步态参数 / 动作组：只换传进来的键，其余保持原样
+                if path == "/api/v1/twin/store":
+                    patch = body.get("patch") if isinstance(body.get("patch"), dict) else body
+                    try:
+                        store = twin_mod.save(patch)
+                    except Exception as e:  # noqa: BLE001
+                        return self._send_json({"ok": False, "error": str(e)}, 400)
+                    return self._send_json({"ok": True, "store": store})
+
+                if path == "/api/v1/twin/store/reset":
+                    try:
+                        store = twin_mod.reset_section((body.get("section") or "").strip())
+                    except Exception as e:  # noqa: BLE001
+                        return self._send_json({"ok": False, "error": str(e)}, 400)
+                    return self._send_json({"ok": True, "store": store})
+
+                if path in ("/api/v1/twin/servo/move", "/api/v1/twin/servo/unload",
+                            "/api/v1/twin/sequence", "/api/v1/twin/sequence/stop",
+                            "/api/v1/twin/gait/start", "/api/v1/twin/gait/stop",
+                            "/api/v1/twin/estop") and not did:
+                    return self._send_json(
+                        {"ok": False, "error": "没有可用设备：板子需先连上音频 WS"},
+                        409)
+
+                if path == "/api/v1/twin/servo/move":
+                    servos = body.get("servos")
+                    if not isinstance(servos, list) or not servos:
+                        return self._send_json({"ok": False, "error": "servos 必填"}, 400)
+                    r = servo_dispatch(did, "servo.move", {"servos": servos},
+                                       policy="interrupt")
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/servo/unload":
+                    ids = body.get("ids")
+                    ids = [int(x) for x in ids] if isinstance(ids, list) else []
+                    if not ids:
+                        return self._send_json({"ok": False, "error": "ids 必填"}, 400)
+                    r = servo_dispatch(did, "servo.unload", {"ids": ids},
+                                       policy="interrupt")
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/sequence":
+                    steps = body.get("steps")
+                    if not isinstance(steps, list) or not steps:
+                        return self._send_json({"ok": False, "error": "steps 必填"}, 400)
+                    repeat = body.get("repeat", 1)
+                    if repeat is True:
+                        repeat = 0                      # true = 不限次数
+                    try:
+                        repeat = int(repeat)
+                    except (TypeError, ValueError):
+                        repeat = 1
+                    if repeat < 0:
+                        repeat = 0
+                    if repeat == 1:
+                        r = servo_dispatch(did, "sequence.run", {"steps": steps})
+                        r["device_id"] = did
+                        return self._send_json(r, 200 if r.get("ok") else 409)
+                    # 重复播放交给服务端后台线程：页面关掉也能一直跑
+                    ok, reason, hint = twin_can_take_over(did, "twin.sequence")
+                    if not ok:
+                        return self._send_json({"ok": False, "error": reason,
+                                                "hint": hint}, 409)
+                    try:
+                        gap = int(body.get("gap_ms") or 50)
+                    except (TypeError, ValueError):
+                        gap = 50
+                    r = TWIN_SEQ.start(did, steps, total_rounds=repeat, gap_ms=gap)
+                    r["device_id"] = did
+                    r["est_round_ms"] = twin_mod.sequence_duration_ms(steps)
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/sequence/stop":
+                    TWIN_SEQ.stop()
+                    r = servo_dispatch(did, "sequence.stop", {})
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/gait/start":
+                    ok, reason, hint = twin_can_take_over(did, "twin.gait")
+                    if not ok:
+                        return self._send_json({"ok": False, "error": reason,
+                                                "hint": hint}, 409)
+                    params = body.get("params")
+                    r = TWIN_GAIT.start(did, params if isinstance(params, dict) else None)
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/gait/stop":
+                    r = TWIN_GAIT.stop(reason="user")
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                if path == "/api/v1/twin/estop":
+                    twin_stop_all(did, reason="estop")
+                    r = servo_dispatch(did, "motion.emergency_stop", {})
+                    r["device_id"] = did
+                    return self._send_json(r, 200 if r.get("ok") else 409)
+
+                return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+            # /api/v1/devices/{did}/commands/{cid}/status
+            if (len(parts) == 7 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "devices" and parts[4] == "commands"
+                    and parts[6] == "status"):
+                did, cid = parts[3], parts[5]
+                body = self._read_json()
+                if not self._auth_ok(did):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                with CTRL_LOCK:
+                    cmd = CMD_QUEUES.get(did)
+                    if cmd is None or cmd.get("id") != cid:
+                        return self._send_json({"ok": False, "error": "command not found"}, 404)
+                    if "status" in body:
+                        cmd["status"] = body["status"]
+                    if "progress" in body:
+                        cmd["progress"] = body["progress"]
+                    if "message" in body:
+                        cmd["message"] = body["message"]
+                    if "error_code" in body:
+                        cmd["error_code"] = body["error_code"]
+                    cmd["_updated"] = time.time()
+                    terminal = cmd["status"] in ("succeeded", "failed", "rollback")
+                    if terminal:
+                        DEVICES.setdefault(did, {})["last_status"] = _ctrl_cmd_public(cmd)
+                        CMD_QUEUES[did] = None
+                return self._send_json({"ok": True})
+            # /api/v1/devices/{did}/heartbeat
+            if (len(parts) == 5 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "devices" and parts[4] == "heartbeat"):
+                did = parts[3]
+                body = self._read_json()
+                if not self._auth_ok(did):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                with CTRL_LOCK:
+                    d = DEVICES.setdefault(did, {})
+                    for k in ("fw_version", "running_slot", "ip", "rssi",
+                              "uptime_sec", "free_heap", "psram_free", "busy"):
+                        if k in body:
+                            d[k] = body[k]
+                    d["last_heartbeat"] = _ctrl_now_iso()
+                return self._send_json({"ok": True, "server_time": _ctrl_now_iso()})
+            # /api/v1/devices/{did}/commands  (管理端下发)
+            if (len(parts) == 5 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "devices" and parts[4] == "commands"):
+                did = parts[3]
+                body = self._read_json()
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                t = body.get("type")
+                if t not in ("servo_action", "action_group", "stop", "reboot", "ota"):
+                    return self._send_json({"ok": False, "error": "unknown command type"}, 400)
+                params = body.get("params", {})
+                cmd = _ctrl_enqueue(did, t, params)
+                if cmd is None:
+                    return self._send_json({"ok": False,
+                                            "error": "device busy, one command at a time"}, 409)
+                print(f"[ctrl] 已下发指令 {cmd['id']} 类型 {t} -> 设备 {did}")
+                return self._send_json({"ok": True, "command": _ctrl_cmd_public(cmd)}, 200)
+            # ===== 新版双向架构：设备端点手动登记（控制台填写 ESP32 的 IP:端口:token）=====
+            # ---------- [C-6] 调度中枢接口（下行控制 / 状态 / 播放 / OTA）----------
+            _P = "/api/v1/devices/"
+            if path.startswith(_P):
+                tail = path[len(_P):]
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json() or {}
+
+                if tail.endswith("/command"):
+                    did = tail[:-len("/command")]
+                    cmd = body.get("command")
+                    if not cmd:
+                        return self._send_json({"ok": False, "error": "missing command"}, 400)
+                    res = servo_dispatch(did, cmd, body.get("args") or {},
+                                         priority=body.get("priority"),
+                                         policy=body.get("policy"),
+                                         protect=bool(body.get("protect")),
+                                         mode=body.get("mode"))   # None -> 取 COMMAND_MODE 默认
+                    return self._send_json(res, 200 if res.get("ok") else 409)
+
+                if tail.endswith("/state"):
+                    did = tail[:-len("/state")]
+                    stt = str(body.get("state", "IDLE")).upper()
+                    changed = dev_set_state(did, stt, ip=self.client_address[0])
+                    return self._send_json({"ok": True, "device_id": did,
+                                            "state": stt, "changed": changed})
+
+                if tail.endswith("/face"):
+                    did = tail[:-len("/face")]
+                    res = face_show(did, body.get("name", ""), body.get("duration_ms"))
+                    return self._send_json(res, 200 if res.get("ok") else 409)
+
+                if tail.endswith("/play"):
+                    did = tail[:-len("/play")]
+                    res = audio_play_text(did, body.get("text", ""))
+                    return self._send_json(res, 200 if res.get("ok") else 409)
+
+                if tail.endswith("/audio/abort"):
+                    did = tail[:-len("/audio/abort")]
+                    return self._send_json(play_abort(did))
+
+                if tail.endswith("/ota/start"):
+                    did = tail[:-len("/ota/start")]
+                    res = ota_start(did, body.get("version"), body.get("url"))
+                    return self._send_json(res, 200 if res.get("ok") else 409)
+
+                if tail.endswith("/ota/status"):
+                    did = tail[:-len("/ota/status")]
+                    return self._send_json(ota_status(did))
+
+                if tail.endswith("/ota/ready"):
+                    did = tail[:-len("/ota/ready")]
+                    return self._send_json(ota_ready(did, body.get("version")))
+
+                if tail.endswith("/ota/finish"):
+                    did = tail[:-len("/ota/finish")]
+                    return self._send_json(ota_finish(
+                        did, ok=bool(body.get("ok", True)),
+                        version=body.get("version"), note=body.get("note", "")))
+
+            if path == "/api/v1/device-endpoints":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                body = self._read_json()
+                did = body.get("device_id")
+                host = body.get("host")
+                if not did or not host:
+                    return self._send_json({"ok": False, "error": "device_id & host required"}, 400)
+                if device_endpoint_register(did, host, body.get("port", 80),
+                                            body.get("token", ""), auto=False, overwrite=True):
+                    return self._send_json({"ok": True, "endpoint": DEVICE_ENDPOINTS.get(did),
+                                            "endpoints": DEVICE_ENDPOINTS})
+                return self._send_json({"ok": False, "error": "register failed"}, 500)
+            # ===== 新版双向架构：服务端主动 POST 到 ESP32 的 /api/v1/command =====
+            if (len(parts) == 5 and parts[0] == "api" and parts[1] == "v1"
+                    and parts[2] == "devices" and parts[4] == "command"):
+                did = parts[3]
+                body = self._read_json()
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                command = body.get("command")
+                if not command:
+                    return self._send_json({"ok": False, "error": "missing command"}, 400)
+                ok, reply, code = device_send_command(did, command, body.get("args", {}))
+                return self._send_json({"ok": ok, "device_id": did,
+                                        "esp32_status": code, "reply": reply},
+                                       200 if ok else 502)
+            return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+
+
+# ---------------------------------------------------------------------------
+# [C-5] 服务启动：ThreadingHTTPServer 守护线程（:8000）
+# ---------------------------------------------------------------------------
+def start_ctrl_server():
+    """启动设备控制/OTA HTTP 服务（独立线程）。"""
+    http.server.ThreadingHTTPServer((CTRL_HOST, CTRL_PORT), ControlHandler).serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# 工具：本机局域网 IP 探测（仅供打印提示）
 # ---------------------------------------------------------------------------
 def local_ips():
     """拿到本机所有局域网 IP，方便用户核对 ESP32 里的 URL 写没写对。"""
@@ -864,9 +3055,31 @@ def local_ips():
     return ips
 
 
+# ===========================================================================
+# [D] 入口：main() —— 统一编排两套服务（控制先于语音；--ctrl-only 时仅控制）
+# ===========================================================================
 async def main():
-    global LOOP
+    global LOOP, PORT, HTTP_PORT, MODEL, ENGINE, DEVICE, COMPUTE, BUTTON_GAP_S, SAVE_WAV, DENOISE, VAD, PC_INPUT, PC_INPUT_CONFIRM
+    global CTRL_ONLY, CTRL_ENABLED, CTRL_HOST, CTRL_PORT, FIRMWARE_DIR, CTRL_HTML, DEVICE_TOKENS_FILE
     LOOP = asyncio.get_running_loop()
+    # ---- 设备控制 / OTA 服务（:8000）----
+    load_firmware_index()
+    load_device_tokens()
+    load_device_endpoints()
+    _load_tts()          # 接得上 edge-tts 就用真语音，接不上自动回退提示音
+    _load_brain()        # 大脑层：DOG_BRAIN=1 且配好 LLM_API_KEY 才真正可用
+    if CTRL_ENABLED:
+        threading.Thread(target=start_ctrl_server, daemon=True).start()
+        threading.Thread(target=_ctrl_timeout_scanner, daemon=True).start()
+        print(f"[ctrl] 服务总入口（聚合首页）: http://{CTRL_HOST}:{CTRL_PORT}/  (管理台 /ctrl · 语音监测台 /voice)")
+        if CTRL_ONLY:
+            print("[ctrl] --ctrl-only：仅运行控制服务，按 Ctrl+C 停止。")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n[ctrl] 已停止，Bye.")
+            return
     load_asr()
     if _OPUS_DECODER is None:
         print("[xz] 警告：未安装 opuslib_next，无法解码 xiaozhi 采集端的 OPUS 音频。")
@@ -874,9 +3087,8 @@ async def main():
         print("          推荐 conda install -c conda-forge opus 或把 opus.dll 放到目录）")
     await broadcast_asr_status()
     threading.Thread(target=asr_worker, daemon=True).start()
-    threading.Thread(target=serve_http, daemon=True).start()
-    print(f"[server] 监测 GUI: http://localhost:{HTTP_PORT}/")
-    print(f"[server] WebSocket :{PORT}  (?role=mic 麦克风 / ?role=dash 监测 / ?role=xiaozhi 小智采集端)")
+    print(f"[server] 语音监测台页面（由控制服务统一托管）: http://localhost:{CTRL_PORT}/voice")
+    print(f"[server] WebSocket :{PORT}  (?role=mic 麦克风 / ?role=dash 监测 / ?role=xiaozhi 小智采集端 / ?role=dog 机器狗采集端)")
     print(f"[server] PCM={SAMPLE_RATE}Hz int16 单声道 | 按钮间隙={BUTTON_GAP_S}s")
     ip_list = local_ips()
     print(f"[server] 本机可用 IP: {', '.join(ip_list) if ip_list else '未能自动获取'}   "
@@ -886,10 +3098,11 @@ async def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="机器狗麦克风端语音 ASR 服务器（仅识别）")
+    parser = argparse.ArgumentParser(description="机器狗 PC 服务端：语音 ASR(WS:8765) + 设备控制/OTA(HTTP:8000)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=PORT)
-    parser.add_argument("--http-port", type=int, default=HTTP_PORT)
+    parser.add_argument("--http-port", type=int, default=HTTP_PORT,
+                        help="[遗留] 旧独立监测台端口(:8080)，已废弃；语音监测台现由控制服务在 :8000/voice 提供，本参数不再生效")
     parser.add_argument("--engine", choices=["funasr", "whisper"], default=ENGINE,
                         help="ASR 引擎：funasr（默认，SenseVoice 中文流式+抗噪强）/ whisper（做对比）")
     parser.add_argument("--model", default=MODEL,
@@ -909,6 +3122,16 @@ if __name__ == "__main__":
     parser.add_argument("--pc-input-confirm", action="store_true",
                         help="PC 语音输入（确认模式）：识别后先缓存不发送，等板子发 "
                              "{\"type\":\"pc_input\",\"action\":\"confirm\"} 才粘贴到焦点窗口，避免误输入")
+    parser.add_argument("--ctrl-only", action="store_true",
+                        help="仅启动设备控制/OTA 服务(:8000)，不加载 ASR、不起 WebSocket（方便在没有 torch 的机器上调试控制服务）")
+    parser.add_argument("--no-ctrl", action="store_true",
+                        help="不启动设备控制/OTA 服务（仅 ASR）")
+    parser.add_argument("--ctrl-host", default=CTRL_HOST, help="控制服务监听地址（默认 0.0.0.0）")
+    parser.add_argument("--ctrl-port", type=int, default=CTRL_PORT, help="控制服务端口（默认 8000）")
+    parser.add_argument("--firmware-dir", default=FIRMWARE_DIR, help="固件目录（默认 ./firmware）")
+    parser.add_argument("--ctrl-html", default=CTRL_HTML, help="管理页文件（默认 ./ctrl.html）")
+    parser.add_argument("--device-tokens", default=None,
+                        help="设备 token 表 JSON（{device_id: token}）；不指定则开发模式接受任意 token")
     a = parser.parse_args()
 
     PORT = a.port
@@ -923,6 +3146,13 @@ if __name__ == "__main__":
     VAD = not a.no_vad
     PC_INPUT = a.pc_input or a.pc_input_confirm
     PC_INPUT_CONFIRM = a.pc_input_confirm
+    CTRL_ONLY = a.ctrl_only
+    CTRL_ENABLED = not a.no_ctrl
+    CTRL_HOST = a.ctrl_host
+    CTRL_PORT = a.ctrl_port
+    FIRMWARE_DIR = a.firmware_dir
+    CTRL_HTML = a.ctrl_html
+    DEVICE_TOKENS_FILE = a.device_tokens
     if PC_INPUT and os.name != "nt":
         print("[pc-input] 警告：非 Windows 平台，--pc-input / --pc-input-confirm 无效")
         PC_INPUT = False

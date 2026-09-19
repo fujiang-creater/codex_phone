@@ -13,6 +13,17 @@
   .pill { font-size:12px; padding:3px 10px; border-radius:999px; background:var(--panel); border:1px solid var(--line); }
   .pill.on { color:var(--ok); border-color:var(--ok); }
   .pill.off { color:var(--warn); }
+  .homelink { margin-left:auto; font-size:12px; color:var(--ok); text-decoration:none;
+              background:var(--panel); border:1px solid var(--line); border-radius:999px;
+              padding:3px 12px; white-space:nowrap; }
+  .homelink:hover { border-color:var(--ok); }
+  .portbar { display:flex; align-items:center; gap:8px; padding:8px 20px; border-bottom:1px solid var(--line); background:#15233b; font-size:12px; flex-wrap:wrap; }
+  .portbar .lbl { color:var(--dim); }
+  .portbar .pbtn { background:transparent; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px; }
+  .portbar .pbtn.active { border-color:var(--ok); color:var(--ok); }
+  .portbar .pin { width:84px; background:#0b1220; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:4px 8px; font-size:12px; }
+  .portbar .pgo { background:var(--ok); border:none; color:#04211a; border-radius:6px; padding:4px 12px; cursor:pointer; font-weight:600; }
+  .portbar .pinfo { color:var(--dim); }
   .grid { display:grid; grid-template-columns: 1fr 360px; gap:16px; padding:16px 20px; }
   @media (max-width: 860px){ .grid { grid-template-columns:1fr; } }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
@@ -41,8 +52,17 @@
     <span id="conn" class="pill off">未连接</span>
     <span id="mic" class="pill off">麦克风未连接</span>
     <span id="asr" class="pill off">模型未加载</span>
-    <span class="pill">WS :8765 · HTTP :8080</span>
+    <span id="portpill" class="pill">WS :—</span>
+    <a class="homelink" href="/">← 返回服务台主页</a>
   </header>
+  <div id="portbar" class="portbar">
+    <span class="lbl">WS 端口</span>
+    <button class="pbtn" data-port="8765">8765</button>
+    <button class="pbtn" data-port="8766">8766</button>
+    <input id="wsport" class="pin" type="number" min="1" max="65535" value="8765" />
+    <button id="wsgo" class="pgo">连接</button>
+    <span id="portinfo" class="pinfo">页面加载后会自动识别实际端口</span>
+  </div>
 
   <div class="grid">
     <div>
@@ -74,13 +94,14 @@
   <div class="hint">设备只在按住 GPIO9 时发送 PCM；约 300ms 无数据判定说话结束并整段识别。本阶段仅做语音识别，不含控制端转发。</div>
 
 <script>
-const WS = `ws://${location.hostname}:8765/?role=dash`;
+let wsPort = 8765;
+const WS = () => `ws://${location.hostname}:${wsPort}/?role=dash`;
 const $ = id => document.getElementById(id);
 const vu = $("vu"), textEl = $("text"), wave = $("wave"), wctx = wave.getContext("2d");
 
 let ws;
 function connect() {
-  ws = new WebSocket(WS);
+  ws = new WebSocket(WS());
   ws.onopen = () => setConn(true);
   ws.onclose = () => { setConn(false); setTimeout(connect, 2000); };
   ws.onmessage = e => {
@@ -168,6 +189,29 @@ function log(msg){
   const box = $("log"); box.prepend(d);
   while (box.childElementCount > 80) box.removeChild(box.lastChild);
 }
+
+// ---- 端口选择器（调试用）----
+const wsportEl = $("wsport"), portinfoEl = $("portinfo"), portpillEl = $("portpill");
+function setWsPort(p, fromInfo) {
+  p = parseInt(p, 10);
+  if (!p || p < 1 || p > 65535) return;
+  wsPort = p;
+  wsportEl.value = p;
+  document.querySelectorAll(".portbar .pbtn").forEach(b =>
+    b.classList.toggle("active", parseInt(b.dataset.port, 10) === p));
+  portpillEl.textContent = "WS :" + p;
+  if (!fromInfo) { portinfoEl.textContent = "已切换，正在重连…"; try { if (ws) ws.close(); } catch (e) {} }
+}
+$("wsgo").addEventListener("click", () => setWsPort(wsportEl.value));
+document.querySelectorAll(".portbar .pbtn").forEach(b =>
+  b.addEventListener("click", () => setWsPort(b.dataset.port)));
+// 自动识别当前服务实际 WS 端口
+fetch("/api/v1/info").then(r => r.json()).then(j => {
+  if (j && j.ok && j.ws_port) {
+    setWsPort(j.ws_port, true);
+    portinfoEl.textContent = "已自动识别 WS 端口 " + j.ws_port + "（如需调试其他实例可选上方端口）";
+  }
+}).catch(() => { portinfoEl.textContent = "无法自动识别端口，请手动选择"; });
 
 connect();
 window.addEventListener("resize", () => drawWave([]));

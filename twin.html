@@ -1,0 +1,910 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>机器狗 · 数字孪生主控台</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --accent2: #0f9d58;
+    --warn: #d97706; --bad: #dc2626; --ok: #0f9d58; --busy: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  header a { color: var(--accent); text-decoration: none; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .wrap { display: grid; grid-template-columns: minmax(420px,1fr) 380px; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 1040px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; }
+  .card h3 { margin: 14px 0 6px; font-size: 13px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, select, textarea { width: 100%; height: 32px; border: 1px solid var(--line);
+    border-radius: 6px; padding: 0 8px; background: #fff; color: var(--ink); font-size: 13px; }
+  textarea { height: 96px; padding: 8px; resize: vertical; }
+  input[type=range] { padding: 0; height: 22px; }
+  button { height: 32px; border: 1px solid var(--accent); border-radius: 6px;
+    background: var(--accent); color: #fff; padding: 0 12px; cursor: pointer; font-size: 13px; }
+  button.lite { background: #fff; color: var(--ink); border-color: var(--line); }
+  button.danger { background: var(--bad); border-color: var(--bad); }
+  button.go { background: var(--accent2); border-color: var(--accent2); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); gap: 8px; }
+  .pill { display: inline-block; font-size: 12px; padding: 3px 8px; border-radius: 999px;
+    background: #eef2f7; color: var(--muted); margin: 0 6px 6px 0; }
+  .pill.on { background: #e7f6ec; color: var(--ok); }
+  .pill.off { background: #fdecec; color: var(--bad); }
+  .pill.warn { background: #fdf3e3; color: var(--warn); }
+  #view { width: 100%; height: 460px; background: #101820; border-radius: 10px; display: block;
+    touch-action: none; }
+  .out { white-space: pre-wrap; background: #f7f9fc; border: 1px solid var(--line);
+    border-radius: 6px; padding: 9px; min-height: 38px; font-size: 12px;
+    font-family: ui-monospace, Consolas, monospace; max-height: 190px; overflow: auto; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .row { display: grid; grid-template-columns: 84px 1fr 46px; gap: 8px; align-items: center;
+    margin: 6px 0; }
+  .row b { font-size: 12px; font-weight: 500; }
+  .leg-buttons button { background: #fff; color: var(--ink); border-color: var(--line); }
+  .leg-buttons button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .cal-row { display: grid; grid-template-columns: 62px 52px 62px 50px 62px 44px; gap: 5px;
+    align-items: center; margin: 4px 0; font-size: 11px; }
+  .cal-row input, .cal-row select { height: 26px; font-size: 12px; padding: 0 5px; }
+  .servo-row { display: grid; grid-template-columns: 52px 1fr 1fr; gap: 8px; align-items: end;
+    margin: 6px 0; }
+  .servo-row input { height: 28px; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 8px 0; }
+  .motion-list { max-height: 300px; overflow: auto; }
+  .note { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 6px 0 0; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; font-size: 12px; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: #f7f9fc;
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px; height: 140px;
+    overflow: auto; white-space: pre-wrap; }
+  .portsel { display: flex; gap: 6px; align-items: center; }
+  .portsel .pbtn { height: 26px; padding: 0 8px; font-size: 12px; background: #fff;
+    color: var(--ink); border-color: var(--line); }
+  .portsel .pbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .portsel .pin { width: 74px; height: 26px; font-size: 12px; }
+  .portsel .pgo { height: 26px; padding: 0 9px; font-size: 12px; }
+  .pinfo { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>机器狗 · 数字孪生主控台</h1>
+  <div class="sub">
+    孪生、标定与动作组数据存在服务端；步态跑在服务端后台线程，页面关掉也继续走。
+    <a href="/">首页</a> · <a href="/ctrl">设备台</a> · <a href="/brain">模型台</a>
+  </div>
+  <div class="bar" style="margin-top:10px;">
+    <div style="width:220px;"><label style="margin:0 0 4px;">目标设备</label>
+      <select id="device"></select></div>
+    <div style="width:220px;"><label style="margin:0 0 4px;">访问 token（Bearer）</label>
+      <input id="token" type="password" placeholder="设备 token" /></div>
+    <div style="width:190px;"><label style="margin:0 0 4px;">控制端口</label>
+      <div class="portsel">
+        <button class="pbtn" data-port="8000">8000</button>
+        <button class="pbtn" data-port="8001">8001</button>
+        <input id="portInput" class="pin" type="number" placeholder="其他" />
+        <button id="portGo" class="pgo">应用</button>
+      </div>
+    </div>
+    <div style="flex:1;min-width:200px;"><label style="margin:0 0 4px;">服务端地址</label>
+      <input id="base" value="" placeholder="留空=同源" /></div>
+    <div style="align-self:flex-end;"><button class="lite" id="refresh">刷新状态</button></div>
+    <div style="align-self:flex-end;"><button class="danger" id="estop">急停</button></div>
+  </div>
+  <div style="margin-top:8px;" id="headPills"></div>
+</header>
+
+<div class="wrap">
+  <div>
+    <div class="card" style="padding:10px;">
+      <canvas id="view"></canvas>
+      <div class="note">拖动画布中的脚端红点可反解（需勾选「拖脚 IK」）。孪生只做可视化与运动学，
+        真狗的动作全部经服务端 WS 命令层下发。</div>
+    </div>
+
+    <div class="card">
+      <h2>实时下发预览</h2>
+      <div class="bar">
+        <button id="deployBtn">下发当前姿态</button>
+        <button class="lite" id="readPoseBtn">读取真实位置为当前值</button>
+        <button class="lite" id="calCapBtn">记录当前为中位</button>
+        <button class="danger" id="unloadBtn">卸力全部 ID</button>
+      </div>
+      <div class="out mono" id="payload" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>步态 gait（服务端线程）</h2>
+      <div class="bar">
+        <button class="go" id="gaitStart">开始 trot</button>
+        <button class="lite" id="gaitStop">停止</button>
+        <button class="lite" id="standBtn">站立</button>
+        <label style="display:flex;gap:6px;align-items:center;margin:0;width:auto;">
+          <input id="deployOn" type="checkbox" checked style="width:auto;height:auto;" />
+          下发到真狗</label>
+      </div>
+      <div class="row"><b>周期 s</b><input type="range" id="g_period" min="0.3" max="1.5" step="0.05" value="0.7"><span id="g_periodv">0.70</span></div>
+      <div class="row"><b>步幅 mm</b><input type="range" id="g_stride" min="20" max="140" step="2" value="70"><span id="g_stridev">70</span></div>
+      <div class="row"><b>抬腿 mm</b><input type="range" id="g_lift" min="10" max="80" step="2" value="35"><span id="g_liftv">35</span></div>
+      <div class="row"><b>站高 mm</b><input type="range" id="g_bodyHeight" min="60" max="160" step="1" value="95"><span id="g_bodyHeightv">95</span></div>
+      <div class="row"><b>单步时长 ms</b><input type="range" id="g_moveMs" min="100" max="2000" step="10" value="500"><span id="g_moveMsv">500</span></div>
+      <div class="row"><b>下发间隔 ms</b><input type="range" id="g_deployMs" min="40" max="500" step="10" value="120"><span id="g_deployMsv">120</span></div>
+      <div class="note">勾上「下发到真狗」时，姿态由服务端线程解算并按下发间隔推给板子；不勾则只在本地预览。
+        参数改动即时保存，运行中也能改，下一拍生效。</div>
+      <div class="kv" id="gaitState" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>舵机（手动 / 表格）</h2>
+      <label>舵机 ID 列表（逗号分隔，顺序 = FL/FR/BL/BR 各 a0,a1,a2）</label>
+      <div class="bar">
+        <input id="idList" value="1,2,3,4,5,6,7,8,9,10,11,12" style="flex:1;min-width:240px;" />
+        <button class="lite" id="renderRows">刷新行</button>
+        <input id="allTime" type="number" min="0" max="65535" value="300" style="width:92px;" />
+        <button class="lite" id="setAllTime">统一时间</button>
+        <button id="sendAll">一键下发全部</button>
+      </div>
+      <div id="allRows" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>动作组</h2>
+      <div class="bar">
+        <select id="motionGroup" style="width:130px;"></select>
+        <input id="motionName" placeholder="动作组名称" style="flex:1;min-width:150px;" />
+        <button class="lite" id="mgSave">改名保存</button>
+        <button class="lite" id="mgClear">清空</button>
+      </div>
+      <div class="bar" style="margin-top:8px;">
+        <button class="lite" id="capManual">捕获手动值</button>
+        <button class="lite" id="capPose">捕获页面姿态</button>
+        <button class="lite" id="capTrue">捕获真狗姿态</button>
+        <input id="motionDelay" type="number" min="0" max="60000" value="150" style="width:96px;" />
+        <input id="motionCount" type="number" min="1" max="9999" value="1" style="width:84px;" />
+        <label style="display:flex;gap:6px;align-items:center;margin:0;width:auto;">
+          <input id="motionRepeat" type="checkbox" style="width:auto;height:auto;" />循环</label>
+        <button class="go" id="playGroup">播放本组</button>
+        <button class="danger" id="stopGroup">停止</button>
+        <button class="lite" id="dropStep">删除最后一步</button>
+      </div>
+      <div class="note">播放走 <span class="mono">sequence.run</span>。勾选「循环」时由服务端线程续播，
+        页面关掉也会继续（板端暂无动作完成事件，按估算时长续播）。</div>
+      <div id="motionInfo" class="note"></div>
+      <div id="motionList" class="motion-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>状态与读取</h2>
+      <div class="bar">
+        <input id="readIds" value="1,2,3,4,5,6,7,8,9,10,11,12" style="flex:1;min-width:220px;" />
+        <button id="readPosBtn">读取位置</button>
+        <button id="readBatBtn">读取电池</button>
+      </div>
+      <div class="out" id="status" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>快捷姿态输入</h2>
+      <div class="note">每行一条，例如 <span class="mono">#1 P462</span>。可写入手动表格、直接下发，
+        或存为当前动作组的一步。</div>
+      <textarea id="quickPose" placeholder="#1 P462&#10;#2 P545&#10;#3 P581"></textarea>
+      <div class="bar" style="margin-top:8px;">
+        <button class="lite" id="qpToTable">写入手动表格</button>
+        <button class="lite" id="qpSend">直接下发</button>
+        <button class="lite" id="qpStep">存为动作一步</button>
+        <button class="lite" id="qpDemo">填充示例</button>
+      </div>
+    </div>
+  </div>
+
+  <aside>
+    <div class="card">
+      <h2>机器狗几何</h2>
+      <div class="grid">
+        <div><label>机身长</label><input id="p_bodyL" type="number" step="0.1"></div>
+        <div><label>机身宽</label><input id="p_bodyW" type="number" step="1"></div>
+        <div><label>前后髋距</label><input id="p_hipX" type="number" step="1"></div>
+        <div><label>左右髋距</label><input id="p_hipZ" type="number" step="1"></div>
+        <div><label>大腿长</label><input id="p_thigh" type="number" step="0.1"></div>
+        <div><label>前小腿</label><input id="p_shinF" type="number" step="0.1"></div>
+        <div><label>后小腿</label><input id="p_shinB" type="number" step="0.1"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>FK / IK 姿态</h2>
+      <div class="bar leg-buttons">
+        <button data-leg="0" class="active">FL</button>
+        <button data-leg="1">FR</button>
+        <button data-leg="2">BL</button>
+        <button data-leg="3">BR</button>
+      </div>
+      <div class="row"><b>外展 a0</b><input type="range" id="a0" min="-60" max="60" value="0"><span id="a0v">0</span></div>
+      <div class="row"><b>大腿 a1</b><input type="range" id="a1" min="-120" max="120" value="15"><span id="a1v">15</span></div>
+      <div class="row"><b>小腿 a2</b><input type="range" id="a2" min="-150" max="150" value="35"><span id="a2v">35</span></div>
+      <div class="bar">
+        <button class="lite" id="applyAll">套用四腿</button>
+        <button class="lite" id="resetPose">重置</button>
+        <label style="display:flex;gap:6px;align-items:center;margin:0;width:auto;">
+          <input id="ikOn" type="checkbox" style="width:auto;height:auto;" />拖脚 IK</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>舵机映射标定</h2>
+      <div class="note">pos = neutral + dir × 角度 × scale，再夹到 min..max。</div>
+      <div id="calTable" style="margin-top:8px;"></div>
+      <div class="bar" style="margin-top:8px;">
+        <button class="lite" id="calReset">重置标定</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>数据文件</h2>
+      <div class="kv" id="storeInfo"></div>
+      <div class="note">改动作组/标定/几何会自动写盘，可随时备份 <span class="mono">twin_store.json</span>。</div>
+    </div>
+
+    <div class="card">
+      <h2>事件日志</h2>
+      <div id="log"></div>
+    </div>
+  </aside>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (m) => {
+  const el = $("log");
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const clampInt = (v, a, b) => { const n = parseInt(v, 10); return Number.isFinite(n) ? clamp(n, a, b) : a; };
+const DEG = Math.PI / 180;
+const LEGS = [{name:"FL",fx:1,side:1,front:true},{name:"FR",fx:1,side:-1,front:true},
+              {name:"BL",fx:-1,side:1,front:false},{name:"BR",fx:-1,side:-1,front:false}];
+const DOF = ["a0","a1","a2"], DOF_LABEL = ["外展","大腿","小腿"];
+
+let PORT = parseInt(location.port || "8000", 10);
+const base = () => ($("base").value || "").replace(/\/+$/, "") ||
+  (String(PORT) === location.port ? "" : `http://${location.hostname}:${PORT}`);
+const headers = () => ({ "Content-Type": "application/json",
+  "Authorization": "Bearer " + $("token").value.trim() });
+
+async function api(method, path, body) {
+  try {
+    const res = await fetch(base() + path, { method, headers: headers(),
+      body: body ? JSON.stringify(body) : undefined });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    return { ok: res.ok, status: res.status, data: data || {} };
+  } catch (e) { return { ok: false, status: 0, data: { error: String(e) } }; }
+}
+const GET = (p) => api("GET", p);
+const POST = (p, b) => api("POST", p, b || {});
+
+function show(x) {
+  $("status").textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2);
+}
+
+/* ---------------- 本地状态 ---------------- */
+const P = {bodyL:255.3, bodyW:120, hipX:96, hipZ:96, thigh:60, shinF:62.1, shinB:77};
+const A = LEGS.map(() => ({a0:0, a1:15, a2:35}));
+const DEF_CAL = () => LEGS.flatMap(l => DOF.map((d,i) =>
+  ({leg:l.name, dof:d, label:DOF_LABEL[i], neutral:500, dir:1, scale:1000/270, min:0, max:1000})));
+let CAL = DEF_CAL();
+let IDS = [1,2,3,4,5,6,7,8,9,10,11,12];
+let MOTIONS = [];
+let MG_COUNT = 10, MG_MAX_STEPS = 20;
+const G = {running:false, t:0, period:0.7, stride:70, lift:35, bodyHeight:95,
+           moveMs:500, deployMs:120, last:0, timer:0, busy:false};
+let selectedLeg = 0, dragLeg = -1, serverGait = null, localGait = false;
+
+const canvas = $("view"), ctx = canvas.getContext("2d");
+let footScreen = [];
+
+/* ---------------- 存储读写（防抖） ---------------- */
+let pending = {}, saveTimer = 0;
+function queueSave(key, value) {
+  pending[key] = value;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, 600);
+}
+async function flushSave() {
+  if (!Object.keys(pending).length) return;
+  const patch = pending; pending = {};
+  const r = await POST("/api/v1/twin/store", { patch });
+  if (!r.ok) { log("保存失败：" + JSON.stringify(r.data)); show(r.data); return; }
+  applyStoreMeta(r.data.store);
+}
+
+function applyStore(store) {
+  if (!store) return;
+  if (store.geometry) for (const k of Object.keys(P)) {
+    if (store.geometry[k] != null) { P[k] = +store.geometry[k]; $(("p_" + k)).value = store.geometry[k]; }
+  }
+  if (Array.isArray(store.calibration) && store.calibration.length === 12) CAL = store.calibration;
+  if (Array.isArray(store.servo_ids) && store.servo_ids.length >= 12) {
+    IDS = store.servo_ids.slice(0, 12); $("idList").value = IDS.join(",");
+  }
+  if (store.gait) {
+    for (const k of ["period","stride","lift","bodyHeight","moveMs","deployMs"]) {
+      if (store.gait[k] != null) { G[k] = +store.gait[k]; setSlider(k, G[k]); }
+    }
+  }
+  if (Array.isArray(store.motion_groups) && store.motion_groups.length) {
+    MOTIONS = store.motion_groups.map((g,i) => ({
+      name: String((g && g.name) || ("动作组 " + (i+1))),
+      steps: Array.isArray(g && g.steps) ? g.steps : []
+    }));
+  }
+  renderCal(); renderRows(); renderMotionSelect(); renderMotionGroup(); updatePayload();
+}
+function applyStoreMeta(store) {
+  if (!store) return;
+  $("storeInfo").innerHTML =
+    `<span>更新时间</span><span class="mono">${store.updated_at || "—"}</span>` +
+    `<span>动作组</span><span>${(store.motion_groups || []).length} 组</span>` +
+    `<span>已配步数</span><span>${(store.motion_groups || []).reduce((n,g)=>n+((g.steps||[]).length),0)} 步</span>`;
+}
+
+/* ---------------- 运动学（与板端页面逐行等价） ---------------- */
+function boardPos(li, d, deg) {
+  const c = CAL[li*3+d] || DEF_CAL()[li*3+d];
+  return Math.round(clamp(+c.neutral + (+c.dir) * deg * (+c.scale), +c.min, +c.max));
+}
+function buildPayload() {
+  const servos = [];
+  A.forEach((a, li) => [a.a0,a.a1,a.a2].forEach((deg, d) =>
+    servos.push({ id: IDS[li*3+d], pos: boardPos(li,d,deg), time: G.moveMs })));
+  return { servos };
+}
+function updatePayload() {
+  const payload = buildPayload();
+  $("payload").textContent = JSON.stringify(payload);
+  document.querySelectorAll(".live-pos").forEach((el, i) =>
+    el.textContent = boardPos(Math.floor(i/3), i%3, A[Math.floor(i/3)][DOF[i%3]]));
+}
+function ikSolve(li, target) {
+  const L1 = P.thigh, L2 = LEGS[li].front ? P.shinF : P.shinB;
+  const x = target.x, y = target.y;
+  const D = clamp(Math.hypot(x,y), Math.abs(L1-L2)+0.5, L1+L2-0.5);
+  const phi = Math.atan2(x, -y);
+  const alpha = Math.acos(clamp((L1*L1 + D*D - L2*L2) / (2*L1*D), -1, 1));
+  const beta = Math.acos(clamp((L1*L1 + L2*L2 - D*D) / (2*L1*L2), -1, 1));
+  return { a1: (phi+alpha)/DEG, a2: -(Math.PI-beta)/DEG };
+}
+function standPose() {
+  for (let i = 0; i < 4; i++) {
+    const sol = ikSolve(i, {x:0, y:-G.bodyHeight});
+    A[i].a0 = 0;
+    A[i].a1 = clamp(sol.a1, -120, 120);
+    A[i].a2 = clamp(sol.a2, -150, 150);
+  }
+  applyFK();
+}
+function gaitStep(dt) {
+  G.t += dt;
+  for (let i = 0; i < 4; i++) {
+    const ph = ((G.t/G.period) + [0,0.5,0.5,0][i]) % 1;
+    let x, lift;
+    if (ph < 0.5) { const s = ph/0.5; x = G.stride*(0.5-s); lift = 0; }
+    else { const s = (ph-0.5)/0.5; x = G.stride*(-0.5+s); lift = G.lift*Math.sin(Math.PI*s); }
+    const sol = ikSolve(i, {x:x, y:-G.bodyHeight+lift});
+    A[i].a0 = 0;
+    A[i].a1 = clamp(sol.a1, -120, 120);
+    A[i].a2 = clamp(sol.a2, -150, 150);
+  }
+}
+
+/* ---------------- 画布 ---------------- */
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.max(320, Math.floor(r.width * devicePixelRatio));
+  canvas.height = Math.max(260, Math.floor(r.height * devicePixelRatio));
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}
+function project(p) {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  return { x: w/2 + p.x*1.05 + p.z*0.42, y: h*0.42 - p.y*1.05 + p.z*0.20 };
+}
+function legPoints(li) {
+  const l = LEGS[li];
+  const hip = { x: l.fx*P.hipX/2, y: G.bodyHeight, z: l.side*P.hipZ/2 };
+  const L1 = P.thigh, L2 = l.front ? P.shinF : P.shinB;
+  const a0 = A[li].a0*DEG, a1 = A[li].a1*DEG, a2 = A[li].a2*DEG;
+  const sideShift = Math.sin(a0)*28*l.side;
+  const knee = { x: hip.x + Math.sin(a1)*L1, y: hip.y - Math.cos(a1)*L1, z: hip.z + sideShift };
+  const foot = { x: knee.x + Math.sin(a1+a2)*L2, y: knee.y - Math.cos(a1+a2)*L2,
+                 z: knee.z + sideShift*0.4 };
+  return [hip, knee, foot];
+}
+function draw() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#101820"; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = "#273447"; ctx.lineWidth = 1;
+  for (let x = -300; x <= 300; x += 50) {
+    const a = project({x:x, y:0, z:-180}), b = project({x:x, y:0, z:180});
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  for (let z = -180; z <= 180; z += 50) {
+    const a = project({x:-300, y:0, z:z}), b = project({x:300, y:0, z:z});
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  const body = [
+    project({x:-P.bodyL/2, y:G.bodyHeight, z:-P.bodyW/2}),
+    project({x: P.bodyL/2, y:G.bodyHeight, z:-P.bodyW/2}),
+    project({x: P.bodyL/2, y:G.bodyHeight, z: P.bodyW/2}),
+    project({x:-P.bodyL/2, y:G.bodyHeight, z: P.bodyW/2})];
+  ctx.fillStyle = "#2563eb"; ctx.strokeStyle = "#93c5fd";
+  ctx.beginPath();
+  body.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  footScreen = [];
+  for (let i = 0; i < 4; i++) {
+    const pts = legPoints(i).map(project);
+    ctx.lineWidth = 7; ctx.lineCap = "round";
+    ctx.strokeStyle = i === selectedLeg ? "#f59e0b" : "#22c55e";
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y); ctx.lineTo(pts[1].x, pts[1].y);
+    ctx.lineTo(pts[2].x, pts[2].y); ctx.stroke();
+    ctx.fillStyle = "#ef4444";
+    ctx.beginPath(); ctx.arc(pts[2].x, pts[2].y, 8, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "#e5e7eb"; ctx.font = "12px sans-serif";
+    ctx.fillText(LEGS[i].name, pts[0].x + 5, pts[0].y - 5);
+    footScreen[i] = pts[2];
+  }
+}
+
+/* ---------------- 姿态 UI ---------------- */
+function syncLegUI(i) {
+  ["a0","a1","a2"].forEach(k => { $(k).value = A[i][k]; $(k+"v").textContent = Number(A[i][k]).toFixed(0); });
+}
+function applyFK() { syncLegUI(selectedLeg); updatePayload(); draw(); }
+
+/* ---------------- 标定表 ---------------- */
+function renderCal() {
+  const box = $("calTable");
+  box.innerHTML = "";
+  CAL.forEach((c, i) => {
+    const row = document.createElement("div");
+    row.className = "cal-row";
+    row.innerHTML = `<b>${c.leg}-${c.label || DOF_LABEL[i%3]}</b>
+      <select data-k="dir" data-i="${i}"><option value="1">+1</option><option value="-1">-1</option></select>
+      <input data-k="neutral" data-i="${i}" type="number" value="${c.neutral}">
+      <input data-k="scale" data-i="${i}" type="number" step="0.001" value="${(+c.scale).toFixed(3)}">
+      <input data-k="max" data-i="${i}" type="number" value="${c.max}">
+      <span class="live-pos">500</span>`;
+    box.appendChild(row);
+    row.querySelector("select").value = String(c.dir);
+  });
+  box.querySelectorAll("input,select").forEach(el => el.addEventListener("input", e => {
+    const c = CAL[+e.target.dataset.i], k = e.target.dataset.k;
+    c[k] = k === "dir" ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+    updatePayload(); queueSave("calibration", CAL);
+  }));
+  updatePayload();
+}
+
+/* ---------------- 手动舵机表格 ---------------- */
+function readRows() {
+  return [...document.querySelectorAll("#allRows .servo-row")].map(r => ({
+    id: +r.dataset.id, pos: r.querySelector(".pos").value, time: r.querySelector(".time").value }));
+}
+function writeRows(rows) {
+  $("allRows").innerHTML = rows.map(r =>
+    `<div class="servo-row" data-id="${r.id}"><strong style="font-size:12px;">ID ${r.id}</strong>
+     <label style="margin:0;">pos<input class="pos" type="number" min="0" max="1000" value="${r.pos}"></label>
+     <label style="margin:0;">time<input class="time" type="number" min="0" max="65535" value="${r.time}"></label>
+     </div>`).join("");
+}
+function renderRows() {
+  const saved = readRows();
+  writeRows(IDS.map((id, i) => ({
+    id, pos: (saved[i] && saved[i].pos) ?? 500, time: (saved[i] && saved[i].time) ?? 300 })));
+}
+function collectRows() {
+  const seen = new Set(), out = [];
+  for (const r of readRows()) {
+    const id = clampInt(r.id, 1, 253);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, pos: clampInt(r.pos, 0, 1000), time: clampInt(r.time, 0, 65535) });
+  }
+  return out;
+}
+
+/* ---------------- 动作组 ---------------- */
+function motionIndex() { return clampInt($("motionGroup").value, 1, MG_COUNT) - 1; }
+function currentMotion() { return MOTIONS[motionIndex()] || (MOTIONS[motionIndex()] = {name:"动作组", steps:[]}); }
+function renderMotionSelect() {
+  $("motionGroup").innerHTML = Array.from({length: MG_COUNT},
+    (_, i) => `<option value="${i+1}">动作组 ${i+1}</option>`).join("");
+  $("motionGroup").value = String(motionIndex() + 1);
+}
+function renderMotionGroup() {
+  const g = currentMotion();
+  $("motionName").value = g.name;
+  $("motionInfo").textContent = `已保存 ${g.steps.length} / ${MG_MAX_STEPS} 步`;
+  $("motionList").innerHTML = g.steps.length ? g.steps.map((s, i) =>
+    `<div class="step"><div class="bar"><strong style="font-size:12px;">Step ${i+1}</strong>
+      <span class="note" style="margin:0;">delay_after ${s.delay_after} ms</span>
+      <button class="lite" data-run="${i}" style="height:26px;font-size:12px;">运行一步</button>
+      <button class="lite" data-del="${i}" style="height:26px;font-size:12px;">删除</button></div>
+      <div class="mono" style="margin-top:6px;color:var(--muted);word-break:break-all;">${JSON.stringify(s)}</div>
+     </div>`).join("") : `<div class="note">当前动作组为空</div>`;
+  document.querySelectorAll("#motionList [data-del]").forEach(b => b.onclick = () => {
+    currentMotion().steps.splice(+b.dataset.del, 1); renderMotionGroup(); queueSave("motion_groups", MOTIONS);
+  });
+  document.querySelectorAll("#motionList [data-run]").forEach(b => b.onclick = () =>
+    playSteps([currentMotion().steps[+b.dataset.run]]));
+}
+function appendStep(step) {
+  const g = currentMotion();
+  if (g.steps.length >= MG_MAX_STEPS) { show("每组最多 " + MG_MAX_STEPS + " 步"); return false; }
+  if (!step || !Array.isArray(step.servos) || !step.servos.length) { show("当前步无效"); return false; }
+  g.steps.push({ servos: step.servos, delay_after: clampInt(step.delay_after, 0, 60000) });
+  renderMotionGroup(); queueSave("motion_groups", MOTIONS);
+  return true;
+}
+
+/* ---------------- 网络动作 ---------------- */
+async function playSteps(steps, repeat) {
+  if (!steps || !steps.length) { show("没有可播放的步骤"); return; }
+  const body = { steps, device_id: $("device").value };
+  if (repeat === 0 || repeat > 1) { body.repeat = repeat === 0 ? true : repeat;
+    body.gap_ms = 50; }
+  const r = await POST("/api/v1/twin/sequence", body);
+  log("播放 -> " + JSON.stringify(r.data).slice(0, 300));
+  show(r.data);
+}
+async function deployNow() {
+  if (G.busy) return;
+  G.busy = true;
+  try {
+    const r = await POST("/api/v1/twin/servo/move",
+      Object.assign(buildPayload(), { device_id: $("device").value }));
+    log("下发姿态 -> " + JSON.stringify(r.data).slice(0, 200));
+    show(r.data);
+  } finally { G.busy = false; }
+}
+async function readPos() {
+  const r = await GET("/api/v1/twin/servo/pos?ids=" + encodeURIComponent($("readIds").value.trim())
+    + "&device_id=" + encodeURIComponent($("device").value));
+  show(r.data); return r;
+}
+async function readCurrentPose() {
+  const r = await readPos();
+  if (!r.ok || !Array.isArray(r.data.positions)) return;
+  const byId = new Map(r.data.positions.map(p => [+p.id, +p.pos]));
+  IDS.forEach((id, i) => {
+    if (!byId.has(+id)) return;
+    const c = CAL[i], pos = byId.get(+id);
+    const deg = (pos - (+c.neutral)) / ((+c.dir) * (+c.scale) || 1);
+    A[Math.floor(i/3)][DOF[i%3]] = clamp(deg, -150, 150);
+  });
+  applyFK();
+}
+
+/* ---------------- 步态 ---------------- */
+function setSlider(k, v) { const el = $("g_" + k); if (el) { el.value = v; $(("g_"+k+"v")).textContent = k === "period" ? (+v).toFixed(2) : String(v); } }
+async function gaitStart() {
+  standPose();
+  G.t = 0;
+  G.last = performance.now();
+  if (!$("deployOn").checked) {
+    localGait = true; G.running = true;
+    log("本地预览步态（未下发）");
+    return;
+  }
+  const r = await POST("/api/v1/twin/gait/start", { device_id: $("device").value });
+  log("步态启动 -> " + JSON.stringify(r.data).slice(0, 300));
+  show(r.data);
+  if (!r.ok) return;
+  G.running = true;
+}
+async function gaitStop() {
+  localGait = false; G.running = false;
+  const r = await POST("/api/v1/twin/gait/stop", { device_id: $("device").value });
+  log("步态停止 -> " + JSON.stringify(r.data).slice(0, 200));
+  if (!r.ok) show(r.data);
+}
+function renderGaitState(s) {
+  const g = (s && s.gait) || {};
+  const sq = (s && s.sequence) || {};
+  const pill = (t, cls) => `<span class="pill ${cls}">${t}</span>`;
+  $("headPills").innerHTML =
+    pill(g.running ? "步态运行中" : "步态停止", g.running ? "on" : "") +
+    pill(sq.running ? `动作组循环中 ${sq.rounds}/${sq.total_rounds || "∞"}` : "动作组未循环",
+         sq.running ? "on" : "") +
+    pill(seqPlaying ? "板端序列播放中" : "板端空闲", seqPlaying ? "warn" : "") +
+    (g.running ? pill(`已下发 ${g.sent} 帧 / 失败 ${g.errors}`, g.errors ? "off" : "") : "");
+  const kv = $("gaitState");
+  const row = (k, v) => `<span>${k}</span><span class="mono">${v}</span>`;
+  kv.innerHTML = row("步态线程", g.running ? "运行中" : "已停止") +
+    row("已运行", (g.elapsed_s ?? 0) + " s") +
+    row("拍数", g.ticks ?? 0) + row("成功下发", g.sent ?? 0) +
+    row("失败", g.errors ?? 0) + row("最近错误", g.last_error || "—");
+  if (g.running && Array.isArray(g.angles) && g.angles.length === 4) {
+    A.forEach((a, i) => { const s2 = g.angles[i]; a.a0 = s2[0]; a.a1 = s2[1]; a.a2 = s2[2]; });
+    syncLegUI(selectedLeg); draw(); updatePayload();
+  }
+}
+async function poll() {
+  const s = await GET("/api/v1/twin/gait");
+  if (s.ok) {
+    serverGait = s.data;
+    const running = !!(s.data.gait && s.data.gait.running);
+    G.running = running || localGait;
+    renderGaitState(s.data);
+  }
+}
+function renderGaitState(s) {
+  const g = (s && s.gait) || {};
+  const sq = (s && s.sequence) || {};
+  const pill = (t, cls) => `<span class="pill ${cls}">${t}</span>`;
+  const playing = !!(s && s.target_playing_sequence);
+  $("headPills").innerHTML =
+    pill(g.running ? "步态运行中" : "步态停止", g.running ? "on" : "") +
+    pill(sq.running ? `动作组循环中 ${sq.rounds}/${sq.total_rounds || "∞"}` : "动作组未循环",
+         sq.running ? "on" : "") +
+    pill(s && s.target_busy
+      ? `设备忙：${s.target_current || "占用中"}` : `设备${s && s.target_state || "未知"}`,
+      playing ? "warn" : (s && s.target_busy ? "warn" : "")) +
+    (g.running ? pill(`已下发 ${g.sent} 帧 / 失败 ${g.errors}`, g.errors ? "off" : "") : "");
+  const row = (k, v) => `<span>${k}</span><span class="mono">${v}</span>`;
+  $("gaitState").innerHTML = row("步态线程", g.running ? "运行中" : "已停止") +
+    row("已运行", (g.elapsed_s ?? 0) + " s") + row("拍数", g.ticks ?? 0) +
+    row("成功下发", g.sent ?? 0) + row("失败", g.errors ?? 0) +
+    row("最近错误", g.last_error || "—") +
+    row("服务端角度", Array.isArray(g.angles) && g.angles[0]
+      ? g.angles[0].map(x => (+x).toFixed(1)).join(" / ") + "（FL）" : "—");
+}
+async function pollStatus() {
+  const r = await GET("/api/v1/twin/status");
+  if (!r.ok) return;
+  const sel = $("device"), cur = sel.value;
+  sel.innerHTML = (r.data.devices || []).map(d =>
+    `<option value="${d.device_id}">${d.device_id}${d.online ? "" : "（离线）"}</option>`).join("") ||
+    `<option value="">（无设备）</option>`;
+  sel.value = cur && (r.data.devices || []).some(d => d.device_id === cur)
+    ? cur : (r.data.target || "");
+  renderGaitState(r.data);
+}
+
+/* ---------------- 主循环 ----------------
+   服务端在跑步态时，页面用同一套参数本地重算一遍只为把画面画顺（60fps）；
+   真正下发的是服务端线程，面板上的帧数/失败数才是真值。 */
+let lastT = performance.now();
+function loop(now) {
+  const dt = Math.min((now - lastT)/1000, 0.05);
+  lastT = now;
+  const serverRunning = !!(serverGait && serverGait.gait && serverGait.gait.running);
+  if (localGait || serverRunning) {
+    gaitStep(dt);
+    syncLegUI(selectedLeg);
+    draw();
+    updatePayload();
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---------------- 事件绑定 ---------------- */
+$("deployBtn").onclick = deployNow;
+$("readPoseBtn").onclick = readCurrentPose;
+$("unloadBtn").onclick = async () => {
+  localGait = false; G.running = false;
+  await gaitStop();
+  const r = await POST("/api/v1/twin/servo/unload", { ids: IDS, device_id: $("device").value });
+  log("卸力 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
+};
+$("calCapBtn").onclick = async () => {
+  const r = await readPos();
+  if (!r.ok || !Array.isArray(r.data.positions)) return;
+  const byId = new Map(r.data.positions.map(p => [+p.id, +p.pos]));
+  IDS.forEach((id, i) => { if (byId.has(+id)) CAL[i].neutral = byId.get(+id); });
+  renderCal(); queueSave("calibration", CAL); show("已把读回位置记为中位");
+};
+$("sendAll").onclick = async () => {
+  const servos = collectRows();
+  if (!servos.length) { show("没有可下发的舵机"); return; }
+  const r = await POST("/api/v1/twin/servo/move", { servos, device_id: $("device").value });
+  log("表格下发 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
+};
+$("renderRows").onclick = renderRows;
+$("setAllTime").onclick = () => document.querySelectorAll("#allRows .time")
+  .forEach(i => i.value = $("allTime").value);
+
+$("gaitStart").onclick = gaitStart;
+$("gaitStop").onclick = gaitStop;
+$("standBtn").onclick = async () => { await gaitStop(); standPose(); await deployNow(); };
+["period","stride","lift","bodyHeight","moveMs","deployMs"].forEach(k => {
+  $("g_" + k).addEventListener("input", e => {
+    G[k] = parseFloat(e.target.value);
+    $(("g_" + k + "v")).textContent = k === "period" ? G[k].toFixed(2) : String(G[k]);
+    queueSave("gait", Object.assign({}, {
+      period:G.period, stride:G.stride, lift:G.lift, bodyHeight:G.bodyHeight,
+      moveMs:G.moveMs, deployMs:G.deployMs, offset:[0,0.5,0.5,0] }));
+  });
+});
+
+$("mgSave").onclick = () => {
+  currentMotion().name = $("motionName").value.trim() || currentMotion().name;
+  renderMotionSelect(); renderMotionGroup(); queueSave("motion_groups", MOTIONS);
+};
+$("mgClear").onclick = () => { currentMotion().steps = []; renderMotionGroup(); queueSave("motion_groups", MOTIONS); };
+$("motionGroup").onchange = renderMotionGroup;
+$("capManual").onclick = () => appendStep({ servos: collectRows(), delay_after: $("motionDelay").value });
+$("capPose").onclick = () => appendStep({ servos: buildPayload().servos, delay_after: $("motionDelay").value });
+$("capTrue").onclick = async () => {
+  const r = await readPos();
+  if (!r.ok || !Array.isArray(r.data.positions)) { show(r.data); return; }
+  const byId = new Map(r.data.positions.map(p => [+p.id, +p.pos]));
+  const servos = [];
+  for (const id of IDS) { if (!byId.has(+id)) { show("缺少舵机 " + id); return; }
+    servos.push({ id, pos: byId.get(+id), time: G.moveMs }); }
+  appendStep({ servos, delay_after: $("motionDelay").value });
+};
+$("dropStep").onclick = () => {
+  const g = currentMotion(); if (g.steps.length) g.steps.pop();
+  renderMotionGroup(); queueSave("motion_groups", MOTIONS);
+};
+$("playGroup").onclick = () => {
+  const g = currentMotion();
+  if (!g.steps.length) { show("当前动作组为空"); return; }
+  const repeat = $("motionRepeat").checked ? 0 : clampInt($("motionCount").value, 1, 9999);
+  playSteps(g.steps, repeat);
+};
+$("stopGroup").onclick = async () => {
+  const r = await POST("/api/v1/twin/sequence/stop", { device_id: $("device").value });
+  log("停止序列 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
+};
+
+$("readPosBtn").onclick = readPos;
+$("readBatBtn").onclick = async () => {
+  const r = await GET("/api/v1/twin/battery?device_id=" + encodeURIComponent($("device").value));
+  show(r.data);
+};
+$("calReset").onclick = async () => {
+  const r = await POST("/api/v1/twin/store/reset", { section: "calibration" });
+  if (r.ok) { applyStore(r.data.store); show("标定已重置"); }
+};
+$("estop").onclick = async () => {
+  localGait = false; G.running = false;
+  const r = await POST("/api/v1/twin/estop", { device_id: $("device").value });
+  log("急停 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
+};
+$("refresh").onclick = async () => { await pollStatus(); show("已刷新"); };
+$("idList").onchange = () => {
+  IDS = $("idList").value.split(",").map(s => clampInt(s.trim(), 1, 253))
+    .filter(n => n > 0).slice(0, 12);
+  while (IDS.length < 12) IDS.push(IDS.length + 1);
+  $("idList").value = IDS.join(",");
+  renderRows(); updatePayload(); queueSave("servo_ids", IDS);
+};
+
+function parseQuick(text, defaultTime) {
+  const servos = [], seen = new Set();
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.trim().match(/^#(\d+)\s*P(\d+)$/i);
+    if (!m) continue;
+    const id = clampInt(m[1], 1, 253);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    servos.push({ id, pos: clampInt(m[2], 0, 1000), time: clampInt(defaultTime, 0, 65535) });
+  }
+  return servos;
+}
+$("qpToTable").onclick = () => {
+  const servos = parseQuick($("quickPose").value, $("allTime").value);
+  if (!servos.length) { show("没有解析到有效数据"); return; }
+  const byId = new Map(readRows().map(r => [+r.id, r]));
+  servos.forEach(s => byId.set(s.id, { id:s.id, pos:s.pos, time:s.time }));
+  writeRows([...byId.values()].sort((a,b) => a.id - b.id));
+  show({ written: servos.length });
+};
+$("qpSend").onclick = async () => {
+  const servos = parseQuick($("quickPose").value, $("allTime").value);
+  if (!servos.length) { show("没有解析到有效数据"); return; }
+  const r = await POST("/api/v1/twin/servo/move", { servos, device_id: $("device").value });
+  show(r.data);
+};
+$("qpStep").onclick = () => appendStep({
+  servos: parseQuick($("quickPose").value, $("allTime").value), delay_after: $("motionDelay").value });
+$("qpDemo").onclick = () => {
+  $("quickPose").value = "#1 P462\n#2 P545\n#3 P581\n#4 P450\n#5 P434\n#6 P664\n" +
+    "#7 P480\n#8 P693\n#9 P899\n#10 P540\n#11 P644\n#12 P839";
+};
+
+["a0","a1","a2"].forEach(k => $(k).addEventListener("input", e => {
+  A[selectedLeg][k] = +e.target.value;
+  $(k + "v").textContent = e.target.value;
+  updatePayload(); draw();
+}));
+document.querySelectorAll(".leg-buttons button").forEach(b => b.addEventListener("click", () => {
+  selectedLeg = +b.dataset.leg;
+  document.querySelectorAll(".leg-buttons button").forEach(x => x.classList.remove("active"));
+  b.classList.add("active"); syncLegUI(selectedLeg); draw();
+}));
+$("applyAll").onclick = () => {
+  const s = Object.assign({}, A[selectedLeg]);
+  A.forEach(a => Object.assign(a, s)); applyFK();
+};
+$("resetPose").onclick = () => {
+  A.forEach(a => { a.a0 = 0; a.a1 = 15; a.a2 = 35; }); applyFK();
+};
+Object.keys(P).forEach(k => $("p_" + k).addEventListener("input", e => {
+  P[k] = parseFloat(e.target.value) || 0;
+  draw(); updatePayload();
+  queueSave("geometry", Object.assign({}, P));
+}));
+
+canvas.addEventListener("pointerdown", e => {
+  if (!$("ikOn").checked) return;
+  const r = canvas.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  dragLeg = -1;
+  footScreen.forEach((p, i) => { if (Math.hypot(p.x - x, p.y - y) < 18) dragLeg = i; });
+  if (dragLeg >= 0) {
+    selectedLeg = dragLeg;
+    document.querySelectorAll(".leg-buttons button").forEach(b =>
+      b.classList.toggle("active", +b.dataset.leg === selectedLeg));
+    syncLegUI(selectedLeg);
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (dragLeg < 0) return;
+  const r = canvas.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const hip = project(legPoints(dragLeg)[0]);
+  const sol = ikSolve(dragLeg, { x: (x - hip.x)/1.05, y: (y - hip.y)/1.05 });
+  A[dragLeg].a1 = clamp(sol.a1, -120, 120);
+  A[dragLeg].a2 = clamp(sol.a2, -150, 150);
+  applyFK();
+});
+window.addEventListener("pointerup", () => dragLeg = -1);
+
+/* ---------------- 启动 ---------------- */
+function applyPort(p, silent) {
+  PORT = p || parseInt(location.port || "8000", 10);
+  document.querySelectorAll(".portsel .pbtn").forEach(b =>
+    b.classList.toggle("active", +b.dataset.port === PORT));
+  if (!silent) log("控制端口切到 " + PORT);
+}
+$("portGo").onclick = () => applyPort(parseInt($("portInput").value, 10) || PORT);
+document.querySelectorAll(".portsel .pbtn").forEach(b =>
+  b.onclick = () => applyPort(+b.dataset.port));
+$("device").onchange = () => { pollStatus(); log("目标设备 -> " + $("device").value); };
+
+(async function boot() {
+  try {
+    const j = await (await fetch("/api/v1/info")).json();
+    applyPort(j.http_port, true);
+  } catch (e) { applyPort(parseInt(location.port || "8000", 10), true); }
+
+  const r = await GET("/api/v1/twin/store");
+  if (!r.ok) { log("读取 twin_store 失败：" + JSON.stringify(r.data)); show(r.data); }
+  else { applyStore(r.data.store); applyStoreMeta(r.data.store);
+         log("已载入 " + r.data.store_path); }
+  await pollStatus();
+  resize();
+  window.addEventListener("resize", resize);
+  setInterval(poll, 1000);          // 步态线程计数：1s 一次够用
+  setInterval(pollStatus, 2000);    // 设备与占用状态：2s 一次
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

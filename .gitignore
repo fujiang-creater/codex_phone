@@ -3,3 +3,6 @@ __pycache__/
 record_*.wav
 _test_*.py
 *.log
+llm_config.json
+# 孪生运行时状态（本机标定/几何/动作组），结构见 twin_store.example.json
+twin_store.json

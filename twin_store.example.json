@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "geometry": {
+    "bodyL": 255.3,
+    "bodyW": 120,
+    "hipX": 96,
+    "hipZ": 96,
+    "thigh": 60,
+    "shinF": 62.1,
+    "shinB": 77
+  },
+  "servo_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12
+  ],
+  "calibration": [
+    {
+      "leg": "FL",
+      "dof": "a0",
+      "label": "外展",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "FL",
+      "dof": "a1",
+      "label": "大腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "FL",
+      "dof": "a2",
+      "label": "小腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "FR",
+      "dof": "a0",
+      "label": "外展",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "FR",
+      "dof": "a1",
+      "label": "大腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "FR",
+      "dof": "a2",
+      "label": "小腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BL",
+      "dof": "a0",
+      "label": "外展",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BL",
+      "dof": "a1",
+      "label": "大腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BL",
+      "dof": "a2",
+      "label": "小腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BR",
+      "dof": "a0",
+      "label": "外展",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BR",
+      "dof": "a1",
+      "label": "大腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    },
+    {
+      "leg": "BR",
+      "dof": "a2",
+      "label": "小腿",
+      "neutral": 500,
+      "dir": 1,
+      "scale": 3.7037037037037037,
+      "min": 0,
+      "max": 1000
+    }
+  ],
+  "gait": {
+    "period": 0.7,
+    "stride": 70,
+    "lift": 35,
+    "bodyHeight": 95,
+    "moveMs": 500,
+    "deployMs": 120,
+    "offset": [
+      0,
+      0.5,
+      0.5,
+      0
+    ]
+  },
+  "motion_groups": [
+    {
+      "name": "动作组 1",
+      "steps": []
+    },
+    {
+      "name": "动作组 2",
+      "steps": []
+    },
+    {
+      "name": "动作组 3",
+      "steps": []
+    },
+    {
+      "name": "动作组 4",
+      "steps": []
+    },
+    {
+      "name": "动作组 5",
+      "steps": []
+    },
+    {
+      "name": "动作组 6",
+      "steps": []
+    },
+    {
+      "name": "动作组 7",
+      "steps": []
+    },
+    {
+      "name": "动作组 8",
+      "steps": []
+    },
+    {
+      "name": "动作组 9",
+      "steps": []
+    },
+    {
+      "name": "动作组 10",
+      "steps": []
+    }
+  ],
+  "updated_at": null
+}
