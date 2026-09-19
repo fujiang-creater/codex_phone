@@ -6,3 +6,6 @@ _test_*.py
 llm_config.json
 # 孪生运行时状态（本机标定/几何/动作组），结构见 twin_store.example.json
 twin_store.json
+# OTA 固件镜像：1.3MB 二进制且每次 idf.py build 都变，不进仓库。
+# 放置规则：firmware/esp32s3/<版本>/app.bin（用板端 build/esp32s3n16r8_idf.bin）
+firmware/**/*.bin
