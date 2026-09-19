@@ -163,6 +163,19 @@
           <input id="playText" value="你好，我是机器狗" />
         </div>
       </div>
+      <div class="row" style="margin-top:8px;">
+        <div>
+          <label>OTA 固件版本（服务端 firmware/esp32s3/ 下的版本目录）</label>
+          <div class="btnrow" style="align-items:center;">
+            <select id="otaVer" style="width:auto;min-width:240px;"><option value="">加载中…</option></select>
+            <button class="lite" id="fwRefreshBtn" style="width:auto;flex:0 0 auto;">刷新固件列表</button>
+            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:12px;white-space:nowrap;flex:0 0 auto;">
+              <input type="checkbox" id="otaStrict" style="width:auto;margin:0;" /> 强制版本校验
+            </label>
+          </div>
+          <div class="pill" id="fwInfo" style="margin-top:6px;">读取中…</div>
+        </div>
+      </div>
       <div class="btnrow">
         <button class="green" id="playBtn">播放（排队）</button>
         <button class="red" id="abortBtn">强制打断</button>
@@ -216,9 +229,27 @@ fetch("/api/v1/info").then(r => r.json()).then(j => {
 
 // 设备状态 -> 颜色/文案
 const STATE_CLASS = { IDLE: "t-pending", LISTENING: "t-busy", SPEAKING: "t-busy",
-  MOVING: "t-busy", UPGRADING: "t-verifying", ERROR: "t-failed", OFFLINE: "t-failed" };
+  MOVING: "t-busy", OTA: "t-verifying", UPGRADING: "t-verifying",
+  ERROR: "t-failed", OFFLINE: "t-failed" };
 const STATE_TEXT = { IDLE: "空闲", LISTENING: "录音中", SPEAKING: "播放中",
-  MOVING: "动作中", UPGRADING: "升级中", ERROR: "错误", OFFLINE: "离线" };
+  MOVING: "动作中", OTA: "升级中", UPGRADING: "升级中", ERROR: "错误", OFFLINE: "离线" };
+
+// OTA 会话 -> 标签。板端每报一次相位/进度就刷新（下载中会带百分比）。
+const OTA_PHASE_TEXT = { pending: "待下发", accepted: "已接受", preparing: "准备中",
+  downloading: "下载中", verifying: "校验中", rebooting: "待重启",
+  succeeded: "已成功", failed: "失败", rollback: "已回滚", interrupted: "已中断" };
+function otaCell(o) {
+  if (!o) return "—";
+  const bad = o.phase === "failed" || o.phase === "rollback" || o.phase === "interrupted";
+  const cls = o.phase === "succeeded" ? "t-succeeded" : (bad ? "t-failed" : "t-downloading");
+  let txt = OTA_PHASE_TEXT[o.phase] || o.phase || "—";
+  if (o.phase === "downloading" && o.progress_percent != null) txt += " " + o.progress_percent + "%";
+  const bits = [];
+  if (o.version) bits.push(o.version);
+  if (o.error_message) bits.push(o.error_message);
+  return `<span class="tag ${cls}">${txt}</span>`
+    + (bits.length ? `<br><small>${bits.join(" · ")}</small>` : "");
+}
 const stateTag = (s) => {
   const cls = STATE_CLASS[s] || "t-pending";
   return `<span class="tag ${cls}">${STATE_TEXT[s] || s || "—"}</span>`;
@@ -288,7 +319,7 @@ async function refreshStates() {
     const q = (r.data.queue || {})[id] || 0;
     const o = ota[id];
     const age = d.age != null ? d.age + "s" : "—";
-    const otaTxt = o ? `<span class="tag ${o.phase === "succeeded" ? "t-succeeded" : (o.phase === "interrupted" || o.phase === "failed" || o.phase === "rollback") ? "t-failed" : "t-downloading"}">${o.phase}${o.version ? " " + o.version : ""}</span>` : "—";
+    const otaTxt = otaCell(o);
     return `<tr><td>${id}</td><td>${stateTag(d.state)}</td>
       <td>${d.ws_alive ? '<span class="tag t-succeeded">已连</span>' : '<span class="tag t-failed">断开</span>'}</td>
       <td>${cur ? cur.command + " P" + cur.priority : "—"}</td>
@@ -386,12 +417,75 @@ $("abortBtn").addEventListener("click", async () => {
   refreshStates();
 });
 
+// ---- OTA 固件版本（服务端 firmware/esp32s3/<版本>/app.bin）----
+// 目录名（1.0.1）是服务端自己起的，镜像内嵌版本（board 的 git describe）是另一回事；
+// 只有勾选"强制版本校验"时服务端才会下发内嵌串给板端做 strncmp。
+let FW_LIST = { latest: null, versions: [] };
+
+function fwInfoHtml(v) {
+  if (!v) return "服务端 firmware/esp32s3/ 下没有可用固件：放好 app.bin 后点「刷新固件列表」。";
+  const mb = (v.size / 1048576).toFixed(2);
+  const when = v.mtime ? new Date(v.mtime * 1000).toLocaleString() : "—";
+  const emb = v.build_version
+    ? `<code>${v.build_version}</code>`
+    : "<b>读不出内嵌版本</b>（非 ESP-IDF 应用镜像，只能靠 sha256 校验）";
+  return `目录 <b>${v.version}</b> · 镜像内嵌 ${emb} · ${mb} MB · 构建于 ${when}`
+       + `<br>sha256 <code>${v.sha256}</code>`;
+}
+
+function updateFwInfo() {
+  const cur = $("otaVer").value;
+  const v = (FW_LIST.versions || []).find(x => x.version === cur);
+  $("fwInfo").innerHTML = fwInfoHtml(v);
+  $("otaStrict").disabled = !(v && v.build_version);
+  if ($("otaStrict").disabled) $("otaStrict").checked = false;
+}
+
+function renderFwSelect(keep) {
+  const sel = $("otaVer");
+  const vs = (FW_LIST.versions || []).slice()
+    .sort((a, b) => String(b.version).localeCompare(String(a.version), undefined, { numeric: true }));
+  sel.innerHTML = vs.length
+    ? vs.map(v => `<option value="${v.version}">${v.version}${v.version === FW_LIST.latest ? "（最新）" : ""}</option>`).join("")
+    : '<option value="">（无固件）</option>';
+  if (keep && vs.some(v => v.version === keep)) sel.value = keep;
+  else if (FW_LIST.latest) sel.value = FW_LIST.latest;
+  updateFwInfo();
+}
+
+async function loadFirmware(keep) {
+  const r = await api("GET", "/api/v1/firmware/esp32s3");
+  if (!r.ok || !r.data || !r.data.ok) {
+    $("otaVer").innerHTML = '<option value="">加载失败</option>';
+    $("fwInfo").textContent = "固件列表加载失败：" + JSON.stringify(r.data);
+    return;
+  }
+  FW_LIST = r.data;
+  renderFwSelect(keep);
+  log(`固件列表已更新：${(FW_LIST.versions || []).length} 个版本，latest=${FW_LIST.latest}`);
+}
+
+$("otaVer").addEventListener("change", updateFwInfo);
+$("fwRefreshBtn").addEventListener("click", () => loadFirmware($("otaVer").value));
+
 $("otaBtn").addEventListener("click", async () => {
   const did = targetDid();
   if (!did) { log("请填写目标设备 ID", "err"); return; }
-  log(`下发 OTA -> ${did}（板端目前为预留实现）…`);
-  const r = await api("POST", `/api/v1/devices/${did}/ota/start`, {});
-  log(r.ok ? `  OTA 已触发 phase=${(r.data || {}).phase}` : `  失败 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  const ver = $("otaVer").value;
+  if (!ver) { log("没有可选固件：先放好 firmware/esp32s3/<版本>/app.bin，再点「刷新固件列表」", "err"); return; }
+  const v = (FW_LIST.versions || []).find(x => x.version === ver) || {};
+  const strict = $("otaStrict").checked;
+  const plan = `设备：${did}\n固件版本：${ver}\n镜像内嵌：${v.build_version || "（读不出）"}\n`
+             + `大小：${v.size} 字节\n校验：${strict ? "强制版本校验（下发内嵌串）+ sha256" : "sha256"}`;
+  if (!confirm(`确认下发 OTA？\n\n${plan}\n\n升级期间该设备会拒绝其他命令，完成后自动重启。`)) {
+    log("已取消 OTA"); return;
+  }
+  log(`下发 OTA -> ${did}：${ver}${strict ? "（强制版本校验）" : ""}…`);
+  const r = await api("POST", `/api/v1/devices/${did}/ota/start`, { version: ver, send_version: strict });
+  const rd = r.data || {};
+  log(r.ok && rd.ok
+    ? `  已受理：版本 ${rd.version}${rd.strict_version ? `，强制校验串 ${rd.strict_version}` : ""} phase=${rd.phase}\n  URL ${rd.url}\n  （板端下载期间看下表 OTA 列的进度，READY_TO_REBOOT 后会自动重启）`
+    : `  失败 [${r.status}]：${JSON.stringify(rd)}`, r.ok && rd.ok ? "ok" : "err");
   refreshStates();
 });
 
@@ -402,6 +496,7 @@ log("管理台已加载，开始轮询设备…");
 refresh();
 refreshEndpoints();
 refreshStates();
+loadFirmware();
 setInterval(refresh, 3000);
 setInterval(refreshStates, 2000);
 </script>

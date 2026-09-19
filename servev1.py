@@ -761,6 +761,8 @@ async def xz_handle_hello(ws, j):
             if metrics:
                 dev_set_state(did, "IDLE", ip=src_ip, metrics=metrics)
                 print(f"[ctrl] 设备 {did} 上报运行数据 {metrics}", flush=True)
+            # OTA 收尾：板端 READY_TO_REBOOT 后会自己重启，重启回来就是这一条 hello
+            ota_on_hello(did)
     except Exception:  # noqa: BLE001
         pass
     hello = {
@@ -823,9 +825,12 @@ async def xz_handle_text(ws, message):
         ws_on_command_result(j)
         return
     if t == "state":
-        # 板子周期状态上报（平时走这条；OTA 阶段 WS 可能已停，改走 HTTP /state）
+        # 板子周期状态上报（OTA 期间这条路照样通——板端只是丢音频帧，不关 WS）
         did = j.get("device_id") or st.get("device_id")
         if did:
+            # 上报里若带 OTA 相位/进度（扁平 ota_* 或嵌套 ota 对象），先并进会话，
+            # 控制台就能实时看到下载百分比，而不是只显示一个 "OTA"。
+            ota_absorb_report(did, j)
             metrics = pick_metrics(j)
             # 板端目前不单独发 state 字段，只回 servo_busy / sequence_playing 这类布尔量，
             # 这里按它推导，省得每来一条就把它打回 IDLE（那会误放掉动作占用，后续命令判空）。
@@ -967,10 +972,12 @@ CTRL_LOCK = threading.Lock()
 
 # ===========================================================================
 # [C-6] 每设备状态机 + 会话注册表 —— 所有下行的调度中枢
-#   状态由板子周期上报（平时走 WS 文本帧，OTA 阶段走 HTTP，因为那时 WS 已停）。
+#   状态由板子周期上报（走音频 WS 文本帧；OTA 期间板端照样保持 WS，只是丢弃音频帧）。
 #   服务端据此做：录音/播放互斥、舵机优先级抢占、busy 拒绝、OTA 全量门禁。
+#   "OTA" 是板端 OTA 期间上报的 state 值（audio_ws.c state_name_for_report），
+#   "UPGRADING" 是服务端自己在 ota_start() 里先占的门禁标；两者语义相同，都要拦命令。
 # ===========================================================================
-DEV_STATES = ("IDLE", "LISTENING", "SPEAKING", "MOVING", "UPGRADING", "ERROR", "OFFLINE")
+DEV_STATES = ("IDLE", "LISTENING", "SPEAKING", "MOVING", "OTA", "UPGRADING", "ERROR", "OFFLINE")
 STATE_TTL_S = 15.0          # 超过该秒数未上报 -> 判定 OFFLINE（仅在 WS 已断时才生效）
 ACTION_TTL_S = 30.0         # 单个动作占用上限；超时未见板子回报完成则自动释放，避免永久锁死
 OTA_TTL_S = 600.0           # OTA 会话上限（10 分钟）；超时未见终态则判 failed，避免永久门禁
@@ -1023,7 +1030,9 @@ WS_DEVICE = {}      # ws -> device_id（断连时反查，用于解绑）
 DEV_CURRENT = {}    # device_id -> {command, priority, since, protect} 当前舵机动作
 PLAY_QUEUE = {}     # device_id -> [ {id, text} ] 待播队列
 PLAY_CURRENT = {}   # device_id -> {id, abort, thread} 正在播放
-OTA_SESSION = {}    # device_id -> {phase, version, since}
+OTA_SESSION = {}    # device_id -> {phase, version, since, progress_percent, ...}
+# OTA 会话的终态：到这几种就不再推进（也不再把断连当"中断"）
+OTA_TERMINAL_PHASES = ("succeeded", "failed", "rollback", "interrupted")
 DEV_LOCK = threading.RLock()
 
 # 命令优先级（服务端侧门禁）：数字越小越优先。
@@ -1167,7 +1176,7 @@ def dev_get_state(device_id):
     out = dict(rec)
     out["age"] = round(age, 1)
     out["ws_alive"] = alive
-    expired = age > STATE_TTL_S and rec.get("state") != "UPGRADING"
+    expired = age > STATE_TTL_S and rec.get("state") not in ("UPGRADING", "OTA")
     if expired and not alive:
         out["state"] = "OFFLINE"
         out["stale"] = True
@@ -1257,11 +1266,18 @@ def dev_unbind_ws(device_id, ws=None):
         queue = PLAY_QUEUE.pop(device_id, None)
         playing = PLAY_CURRENT.get(device_id)
         ota = OTA_SESSION.get(device_id)
-        if ota and ota.get("phase") not in ("succeeded", "failed", "rollback", "interrupted"):
-            ota = dict(ota)
-            ota.update({"phase": "interrupted", "since": time.time(),
-                        "error": "WebSocket 断连"})
-            OTA_SESSION[device_id] = ota
+        if ota and ota.get("phase") not in OTA_TERMINAL_PHASES:
+            if ota.get("phase") == "rebooting":
+                # 板端报 READY_TO_REBOOT 后会自动 esp_restart()，这一断是**预期行为**，
+                # 不能判中断；等它重启回来重新握手时再收尾（见 ota_on_hello）。
+                ota = dict(ota)
+                ota.update({"note": "板子重启中（READY_TO_REBOOT 后的预期断连）"})
+                OTA_SESSION[device_id] = ota
+            else:
+                ota = dict(ota)
+                ota.update({"phase": "interrupted", "since": time.time(),
+                            "error": "WebSocket 断连"})
+                OTA_SESSION[device_id] = ota
     # 播放线程置 abort，让它尽快自行退出（不放锁，避免死锁）
     if playing:
         try:
@@ -1325,8 +1341,12 @@ def dev_gate(device_id, command, policy=None):
     st = dev_get_state(device_id) or {}
     cur_state = st.get("state", "OFFLINE")
     prio = SERVO_PRIORITY.get(command, 3)
-    if cur_state == "UPGRADING":
-        return False, "upgrading", "设备正在 OTA 升级，拒绝一切命令"
+    if cur_state in ("UPGRADING", "OTA"):
+        # 板端协议：OTA 期间普通命令一律回 INVALID_STATE，但 device.status / ota.status /
+        # 急停仍然可用。服务端按同一张清单放行，其余在本地就拦掉（少一次无谓往返）。
+        if not (command in READONLY_COMMANDS or command.startswith("device.")
+                or command.startswith("ota.") or command == "motion.emergency_stop"):
+            return False, "upgrading", "设备正在 OTA 升级，拒绝一切命令"
     if cur_state == "OFFLINE" and st.get("stale") and not st.get("ws_alive"):
         return False, "offline", "WebSocket 已断开且长时间未上报状态，可能已离线"
     # 只读查询 / 设备级命令（status、reboot、read）：不占设备，不受 busy 限制
@@ -1673,7 +1693,7 @@ def twin_can_take_over(device_id, self_cmd):
     self_cmd 是本次要起的占用名：别人的占用要拒，自己重入交给 runner 自己判。
     """
     st = dev_get_state(device_id) or {}
-    if st.get("state") == "UPGRADING":
+    if st.get("state") in ("UPGRADING", "OTA"):
         return False, "upgrading", "设备正在 OTA 升级，拒绝一切命令"
     if dev_get_ws(device_id) is None:
         return False, "offline", "设备离线：没有音频 WS 连接"
@@ -2080,34 +2100,186 @@ def _latest_version():
     return (latest or {}).get("version") if isinstance(latest, dict) else latest
 
 
-def ota_start(device_id, version=None, url=None):
-    """触发 OTA。板端目前是预留实现（回 NOT_IMPLEMENTED 属正常），服务端同步预留。
-    OTA 期间服务端门禁会拒绝一切其他命令。"""
+# 板端 ota_service_state_name() 的枚举 -> 服务端 OTA_SESSION.phase
+# （服务端 phase 词汇沿用原有那套：preparing/downloading/verifying/rebooting/终态）
+OTA_PHASE_MAP = {
+    "PREPARING": "preparing",
+    "DOWNLOADING": "downloading",
+    "VERIFYING": "verifying",
+    "READY_TO_REBOOT": "rebooting",
+    "FAILED": "failed",
+}
+
+
+def _ota_report_value(msg, nested, name, flat_name=None):
+    """从板端上报里取一个 OTA 字段：优先嵌套 ota 对象，再试扁平 ota_* 名，最后按原名校。"""
+    if nested and nested.get(name) is not None:
+        return nested.get(name)
+    if flat_name and msg.get(flat_name) is not None:
+        return msg.get(flat_name)
+    return msg.get(name)
+
+
+def ota_absorb_report(device_id, msg):
+    """把板端 state 上报里的 OTA 信息并进 OTA_SESSION，供控制台显示进度。
+
+    板端有两套写法，两套都要认（audio_ws.c）：
+      · 周期 state 上报：扁平 ota_state / ota_active / ota_progress_percent /
+        ota_written_bytes / ota_total_bytes；
+      · OTA 状态机每次变化触发的 state 事件：嵌套 ota 对象（多带 error / version /
+        error_message）。
+    这里只做"如实记录 + 推进相位"，不代替板端做安全判定——校验与回滚都在板端。
+    返回是否发生了值得打印的变化。
+    """
+    if not isinstance(msg, dict) or not device_id:
+        return False
+    nested = msg.get("ota") if isinstance(msg.get("ota"), dict) else None
+    board_state = None
+    if nested and nested.get("state"):
+        board_state = str(nested["state"]).upper()
+    elif msg.get("ota_state"):
+        board_state = str(msg["ota_state"]).upper()
+    if board_state is None and msg.get("ota_active") is None and nested is None:
+        return False        # 这条上报与 OTA 无关，直接放行
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    percent = _int(_ota_report_value(msg, nested, "progress_percent", "ota_progress_percent"))
+    written = _int(_ota_report_value(msg, nested, "written_bytes", "ota_written_bytes"))
+    total = _int(_ota_report_value(msg, nested, "total_bytes", "ota_total_bytes"))
+    err = _ota_report_value(msg, nested, "error")
+    err_msg = _ota_report_value(msg, nested, "error_message")
+    board_ver = _ota_report_value(msg, nested, "version")
+    active = _ota_report_value(msg, nested, "active")
+    if active is None:
+        active = msg.get("ota_active")
+
+    with DEV_LOCK:
+        sess = dict(OTA_SESSION.get(device_id) or {})
+        prev = sess.get("phase")
+        phase = prev or "preparing"
+        if board_state:
+            if board_state == "IDLE" and not active:
+                # 板端已回到空闲：只要我们还停在活跃相位，就说明这一轮收尾了
+                # （失败路径板端会先发 FAILED 事件，不会走到这里）
+                if prev in ("pending", "accepted", "preparing", "downloading",
+                            "verifying", "rebooting"):
+                    phase = "succeeded"
+            elif board_state in OTA_PHASE_MAP:
+                phase = OTA_PHASE_MAP[board_state]
+        for k, v in (("progress_percent", percent), ("written_bytes", written),
+                     ("total_bytes", total), ("error", err),
+                     ("error_message", err_msg), ("board_state", board_state)):
+            if v is not None:
+                sess[k] = v
+        sess["active"] = bool(active)
+        if board_ver and not sess.get("version"):
+            # 板端回读的是镜像内嵌版本；服务端目录名（如 1.0.1）只作本地索引，两者不同属正常
+            sess["firmware_version"] = board_ver
+        sess["phase"] = phase
+        sess["since"] = time.time()      # 还在报进度 = 板子活着，别让 TTL 误判超时
+        sess["last_report"] = time.time()
+        OTA_SESSION[device_id] = sess
+        changed = (phase != prev) or (percent != sess.get("last_percent"))
+        sess["last_percent"] = percent
+    if changed:
+        print(f"[ota] {device_id} 板端相位 {board_state or '-'} -> {phase}"
+              + (f" {percent}%" if percent is not None else ""), flush=True)
+    return changed
+
+
+def ota_on_hello(device_id):
+    """板子重启后重新握手 = 新固件已经跑起来了，到这里才把 OTA 会话判成功。
+
+    依据板端实现：main.c 只有在服务初始化全部跑完之后才调
+    esp_ota_mark_app_valid_cancel_rollback()；若新镜像起不来，bootloader 会回滚到旧
+    分区再启动，此时会话相位不会是 verifying/rebooting，所以不会被误判成功。
+    """
+    if not device_id:
+        return None
+    with DEV_LOCK:
+        sess = OTA_SESSION.get(device_id)
+        if not sess or sess.get("phase") in OTA_TERMINAL_PHASES:
+            return None
+        if sess.get("phase") not in ("verifying", "rebooting"):
+            return None
+        sess = dict(sess)
+        sess.update({"phase": "succeeded", "since": time.time(), "active": False,
+                     "note": "板子重启后重新握手，视为升级成功"})
+        OTA_SESSION[device_id] = sess
+    dev_set_state(device_id, "IDLE")
+    print(f"[ota] {device_id} 升级成功：板子已带新固件重新握手", flush=True)
+    return sess
+
+
+def ota_start(device_id, version=None, url=None, send_version=False):
+    """触发 OTA：走音频 WS 下发 ota.start，板端下载写入未运行的 OTA 分区。
+
+    ⚠ version 默认**不下发**给板端。板端 ota_service.c 会拿 args.version 与镜像内
+    esp_app_desc.version 做 strncmp，不一致直接 FAILED(INVALID_VERSION)；而固件目录名
+    （服务端的 1.0.1）与镜像内嵌版本（板端 git describe 出来的串）本来就不是一回事。
+    所以 version 在这里只用于"挑本地哪个 app.bin"，不下行；完整性交给 sha256
+    （板端 esp_partition_get_sha256 + 文件 SHA-256 双重核对）。确需强制版本校验时，
+    调用方传 send_version=True —— 服务端会自动改发该镜像**内嵌**的 esp_app_desc.version
+    （见 read_app_desc），不需要调用方知道那个串；读不出来则直接拒绝。
+    """
     ver = version or _latest_version()
     fw = FIRMWARE.get(ver) if ver else None
-    args = {"version": ver}
-    if url:
-        args["url"] = url
-    elif fw:
-        args.update({"url": f"http://{_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
-                     "size": fw.get("size"), "sha256": fw.get("sha256")})
+    if not url and not fw:
+        return {"ok": False, "phase": "failed", "version": ver,
+                "error": f"固件 {ver} 不在索引里（需 firmware/esp32s3/{ver}/app.bin）"}
+    args = {"url": url or f"http://{_lan_ip_for(device_id)}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin"}
+    if fw and fw.get("sha256"):
+        args["sha256"] = fw["sha256"]
+    if send_version:
+        # 板端是拿这个串与镜像内嵌 esp_app_desc.version 做 strncmp 的，
+        # 必须下发镜像内嵌版本（build_version），而非目录名。
+        strict = (fw or {}).get("build_version")
+        if not strict:
+            return {"ok": False, "phase": "failed", "version": ver,
+                    "error": f"固件 {ver} 读不出内嵌版本（不是 ESP-IDF 应用镜像？），"
+                             f"无法强制版本校验；改回 sha256 校验即可"}
+        args["version"] = strict
     dev_set_state(device_id, "UPGRADING")
     with DEV_LOCK:
-        OTA_SESSION[device_id] = {"phase": "preparing", "version": ver, "since": time.time()}
+        OTA_SESSION[device_id] = {"phase": "preparing", "version": ver,
+                                  "since": time.time(), "active": True,
+                                  "progress_percent": 0}
     res = ws_command(device_id, "ota.start", args, mode="sync", policy="interrupt")
     with DEV_LOCK:
         s = OTA_SESSION.get(device_id) or {}
         s["phase"] = "downloading" if res.get("ok") else "failed"
+        if not res.get("ok"):
+            s["error"] = res.get("error") or "板端拒绝 ota.start"
         OTA_SESSION[device_id] = s
     res["phase"] = s["phase"]
+    res["version"] = ver
+    res["url"] = args["url"]
+    res["strict_version"] = args.get("version", "")
     if not res.get("ok"):
         dev_set_state(device_id, "ERROR")
     return res
 
 
 def ota_status(device_id):
-    """查询板端 OTA 状态（预留）。"""
-    return ws_command(device_id, "ota.status", {}, mode="sync", policy="queue")
+    """查询板端 OTA 状态；顺手把板端回的内容并进会话（回包含 state/progress_percent/
+    written_bytes/total_bytes/version/error/error_message）。"""
+    res = ws_command(device_id, "ota.status", {}, mode="sync", policy="queue")
+    data = ((res.get("result") or {}).get("data")
+            or (res.get("result") or {}).get("ota"))
+    if isinstance(data, dict):
+        ota_absorb_report(device_id, {"type": "state",
+                                      "ota_state": data.get("state"),
+                                      "ota": data})
+    with DEV_LOCK:
+        sess = OTA_SESSION.get(device_id)
+    if sess:
+        res["session"] = dict(sess)
+    return res
 
 
 def ota_ready(device_id, version=None):
@@ -2123,7 +2295,7 @@ def ota_ready(device_id, version=None):
         OTA_SESSION[device_id] = s
     dev_set_state(device_id, "UPGRADING")
     return {"ok": True, "phase": "downloading", "version": ver,
-            "url": f"http://{_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
+            "url": f"http://{_lan_ip_for(device_id)}:{CTRL_PORT}/firmware/esp32s3/{ver}/app.bin",
             "size": fw.get("size"), "sha256": fw.get("sha256")}
 
 
@@ -2234,7 +2406,67 @@ def _ctrl_lan_ip():
     return ips[0] if ips else "127.0.0.1"
 
 
+def _lan_ip_for(device_id=None):
+    """挑一个"板子够得着"的本机 IP，用于 OTA 固件 URL。
+
+    本机常挂着多张网卡（虚拟网卡 / WSL / 校园网 / ICS 热点），local_ips() 的第一个
+    是默认出口 IP，未必和板子同网段——下发了板子也连不上。优先级：
+      ① 与设备上报的 IP 同 /24 的那个本机地址（唯一可靠判据）
+      ② 任一 192.168.* 地址（ICS 热点固定用这个网段）
+      ③ local_ips()[0] 兜底
+    """
+    ips = local_ips()
+    if not ips:
+        return "127.0.0.1"
+    with DEV_LOCK:
+        st = dict(DEV_STATE.get(device_id) or {})
+    ep = DEVICE_ENDPOINTS.get(device_id or "") or {}
+    dev_ip = str(st.get("ip") or ep.get("host") or "").strip()
+    if dev_ip.count(".") == 3:
+        net = dev_ip.rsplit(".", 1)[0] + "."
+        for ip in ips:
+            if ip.startswith(net):
+                return ip
+    for ip in ips:
+        if ip.startswith("192.168."):
+            return ip
+    return ips[0]
+
+
 # ---------------------------------------------------------------------------
+# 读 ESP-IDF 应用镜像里内嵌的 esp_app_desc（偏移 0x20，共 256 字节）。
+# 布局：magic(4) secure_version(4) reserv1(8) version[32] project_name[32] ...
+# 固件目录名（服务端自己起的 1.0.1）与镜像内嵌版本（板端 git describe 的串）是两回事，
+# 想开板端强制版本校验就必须用内嵌的那串，否则一定 FAILED(INVALID_VERSION)。
+APP_DESC_OFF = 0x20
+APP_DESC_MAGIC = 0xABCD5432
+
+
+def read_app_desc(path):
+    """解析镜像内嵌描述，返回 {version, project_name, idf_ver}；非应用镜像返回 {}。"""
+    try:
+        with open(path, "rb") as f:
+            blob = f.read(APP_DESC_OFF + 128)
+        if len(blob) < APP_DESC_OFF + 16:
+            return {}
+        import struct
+        magic = struct.unpack_from("<I", blob, APP_DESC_OFF)[0]
+        if magic != APP_DESC_MAGIC:
+            return {}
+
+        def s(off, n):
+            return blob[APP_DESC_OFF + off: APP_DESC_OFF + off + n].split(b"\x00")[0].decode("utf-8", "replace")
+        return {"version": s(16, 32), "project_name": s(48, 32), "idf_ver": s(112, 32)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def ver_sort_key(v):
+    """版本号自然排序：1.0.10 要排在 1.0.9 之后（纯字符串排序会颠倒）。"""
+    return [(1, int(p)) if p.isdigit() else (0, p)
+            for p in re.split(r"(\d+)", str(v)) if p]
+
+
 # [C-2] 加载器：固件索引 / 设备 token（main() 启动时调用一次）
 # ---------------------------------------------------------------------------
 def load_firmware_index():
@@ -2253,8 +2485,13 @@ def load_firmware_index():
             with open(binp, "rb") as f:
                 for chunk in iter(lambda: f.read(65536), b""):
                     h.update(chunk)
+            desc = read_app_desc(binp)
             FIRMWARE[name] = {"device": "esp32s3n16r8", "version": name,
-                              "path": binp, "size": size, "sha256": h.hexdigest()}
+                              "path": binp, "size": size, "sha256": h.hexdigest(),
+                              "build_version": desc.get("version") or "",
+                              "project_name": desc.get("project_name") or "",
+                              "idf_ver": desc.get("idf_ver") or "",
+                              "mtime": os.path.getmtime(binp)}
     latest = None
     fj = os.path.join(FIRMWARE_DIR, "firmware.json")
     if os.path.isfile(fj):
@@ -2265,7 +2502,7 @@ def load_firmware_index():
         except Exception:  # noqa: BLE001
             pass
     if not latest or latest not in FIRMWARE:
-        vers = sorted(FIRMWARE.keys())
+        vers = sorted(FIRMWARE.keys(), key=ver_sort_key)
         latest = vers[-1] if vers else None
     FIRMWARE["__latest__"] = latest
     print(f"[ctrl] 固件表已载入：{len([k for k in FIRMWARE if k != '__latest__'])} 个版本，latest={latest}")
@@ -2303,7 +2540,8 @@ def _ctrl_enqueue(device_id, type_, params):
             "status": "pending", "progress": 0, "message": "", "error_code": None,
             "device_id": device_id, "_updated": time.time(),
         }
-        # OTA：若版本在固件表内，自动补全 url / size / sha256
+        # OTA（旧 HTTP 轮询协议分支，仅存档；现行板端走 WS 的 ota.start，见 ota_start()）：
+        # 若版本在固件表内，自动补全 url / size / sha256
         if type_ == "ota" and isinstance(params, dict):
             ver = params.get("version")
             f = FIRMWARE.get(ver) if ver else None
@@ -2587,13 +2825,29 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     return self._send_json({"ok": False, "error": "no firmware"}, 404)
                 f = FIRMWARE[latest]
                 return self._send_json({"ok": True, "device": f["device"], "version": f["version"],
-                                        "url": f"http://{_ctrl_lan_ip()}:{CTRL_PORT}/firmware/esp32s3/{latest}/app.bin",
-                                        "size": f["size"], "sha256": f["sha256"]})
+                                        "build_version": f.get("build_version", ""),
+                                        "project_name": f.get("project_name", ""),
+                                        "size": f["size"], "sha256": f["sha256"],
+                                        "mtime": f.get("mtime", 0),
+                                        "url": f"http://{_lan_ip_for()}:{CTRL_PORT}/firmware/esp32s3/{latest}/app.bin"})
             # 固件版本列表
             if path == "/api/v1/firmware/esp32s3":
                 if not self._auth_ok(None):
                     return self._send_json({"ok": False, "error": "unauthorized"}, 401)
-                vers = [FIRMWARE[k] for k in FIRMWARE if k != "__latest__"]
+                vers = []
+                for k in sorted(FIRMWARE, key=ver_sort_key):
+                    if k == "__latest__":
+                        continue
+                    f = FIRMWARE[k]
+                    vers.append({
+                        "device": f["device"], "version": f["version"],
+                        "size": f["size"], "sha256": f["sha256"],
+                        "build_version": f.get("build_version", ""),
+                        "project_name": f.get("project_name", ""),
+                        "idf_ver": f.get("idf_ver", ""),
+                        "mtime": f.get("mtime", 0),
+                        "url": f"http://{_lan_ip_for()}:{CTRL_PORT}/firmware/esp32s3/{k}/app.bin",
+                    })
                 return self._send_json({"ok": True, "latest": FIRMWARE.get("__latest__"),
                                         "versions": vers})
             # 设备端点注册表（新版双向架构：服务端直推 ESP32）
@@ -2627,11 +2881,13 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             # /firmware/esp32s3/{version}/app.bin
+            # ⚠ 本路由**故意不鉴权**：板端 OTA 只用裸 HTTP GET（esp_http_client，不带
+            #   Authorization，也只接受 http://）。这里是唯一的固件分发口，作用域仅限
+            #   固件根目录下 app.bin，沿用 _send_file 的路径，不暴露其他文件。
+            #   下发前的准入控制在上游 ota.start（要过 /api/v1 那套鉴权）完成。
             if (len(parts) == 4 and parts[0] == "firmware" and parts[1] == "esp32s3"
                     and parts[3] == "app.bin"):
                 ver = parts[2]
-                if not self._auth_ok(None):
-                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
                 f = FIRMWARE.get(ver)
                 if not f or not os.path.isfile(f["path"]):
                     return self._send_json({"ok": False, "error": "firmware not found"}, 404)
@@ -2951,6 +3207,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
                 if tail.endswith("/state"):
                     did = tail[:-len("/state")]
+                    ota_absorb_report(did, body)
                     stt = str(body.get("state", "IDLE")).upper()
                     changed = dev_set_state(did, stt, ip=self.client_address[0])
                     return self._send_json({"ok": True, "device_id": did,
@@ -2972,7 +3229,8 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
 
                 if tail.endswith("/ota/start"):
                     did = tail[:-len("/ota/start")]
-                    res = ota_start(did, body.get("version"), body.get("url"))
+                    res = ota_start(did, body.get("version"), body.get("url"),
+                                    send_version=bool(body.get("send_version")))
                     return self._send_json(res, 200 if res.get("ok") else 409)
 
                 if tail.endswith("/ota/status"):
