@@ -1,0 +1,61 @@
+{
+  "_comment": "机器狗能力清单 = 服务端 ↔ 板端的翻译表。板端只认 action.run 的 args.group（控制板预存动作组编号 0~255），不认动作名，所以每个动作必须写 args.group；编号要按你控制板里实际存的组号改，改错不会报错，只会播错动作。改完在调试台点「重读清单」即生效，不用重启服务、不用改代码。",
+
+  "_args_help": {
+    "cmd": "action.run 播放预存动作组 / action.stop 停止 / action.speed 调速",
+    "args.group": "控制板预存动作组编号 0~255，必须与上位机里存的一致",
+    "args.times": "重复次数 0~65535，通常 1（板端必填）",
+    "policy": "interrupt = 直接打断板子正在跑的动作；queue = 排队等它跑完，板子忙时会被拒（409）"
+  },
+
+  "persona": "你是一只叫小七的机器狗，性格活泼忠诚、说话简短自然。你在通过语音和主人对话，主人听得到你说的话。",
+
+  "rules": [
+    "回复必须是 30 字以内的中文口语，适合语音播报",
+    "不要出现 emoji、括号、书名号、Markdown、标点以外的特殊符号",
+    "不要自称'作为一个 AI'或'我是语言模型'，你就是一只机器狗",
+    "根据主人的话挑选合适的动作和表情；最多 1 个动作 + 1 个表情，没有合适的就不要调用",
+    "绝对不要调用清单里不存在的动作名",
+    "听不清或没意义的话，就简短地问一句，不要长篇大论",
+    "每次必须调用且只调用一个工具：要做动作调 perform_action，只想换表情调 show_face，两者都不需要就调 direct_answer",
+    "要说的话一律写在工具的 response 参数里（必填）；正文会被忽略，等于没说",
+    "主人说的事只要在动作清单里有对应项，就必须调 perform_action 边说边做，不要只用嘴说而不动",
+    "清单里没有的动作，用 direct_answer 一句话说明做不到，绝对不要编造动作名",
+    "台词是口语，不要出现动作名、工具名、JSON 或任何符号"
+  ],
+
+  "repair_on_failure": true,
+
+  "reject_reply": "这个我做不来诶，换个别的吧",
+  "empty_reply": "嗯？我没听清呢，再说一遍？",
+
+  "max_reply_chars": 30,
+  "history_turns": 6,
+
+  "faces": ["happy", "angry", "sad", "joy"],
+  "board_faces": ["idle", "listening", "thinking", "speaking", "happy", "angry", "sad", "joy", "error", "sleep"],
+  "_faces_help": "faces = 允许大模型主动切的情绪表情（板端字面值，拼错会被服务端拦下）；board_faces = 板端 display_face.c 支持的全部表情，多出来的 listening/thinking/speaking 留给服务端在交互过程中自己用（例如等大模型回包时切 thinking）。",
+
+  "face_say": {
+    "_comment": "只切表情、正文没说话时的兜底话术",
+    "happy": "嘿嘿，我好开心！",
+    "joy": "太好啦！",
+    "sad": "呜……有点难过。",
+    "angry": "哼，我生气啦！"
+  },
+
+  "actions": [
+    {"name": "sit",       "desc": "坐下",       "cmd": "action.run", "args": {"group": 1,  "times": 1}, "policy": "interrupt", "say": "好的，我坐下啦！"},
+    {"name": "stand",     "desc": "站起来",     "cmd": "action.run", "args": {"group": 2,  "times": 1}, "policy": "interrupt", "say": "我站起来咯！"},
+    {"name": "lie_down",  "desc": "趴下",       "cmd": "action.run", "args": {"group": 3,  "times": 1}, "policy": "interrupt", "say": "那我趴下休息一下。"},
+    {"name": "shake",     "desc": "握手",       "cmd": "action.run", "args": {"group": 4,  "times": 1}, "policy": "interrupt", "say": "来，握个手！"},
+    {"name": "nod",       "desc": "点头",       "cmd": "action.run", "args": {"group": 5,  "times": 1}, "policy": "interrupt", "say": "嗯嗯，我同意！"},
+    {"name": "wag_tail",  "desc": "摇尾巴",     "cmd": "action.run", "args": {"group": 6,  "times": 1}, "policy": "interrupt", "say": "尾巴摇起来啦！"},
+    {"name": "stretch",   "desc": "伸懒腰",     "cmd": "action.run", "args": {"group": 7,  "times": 1}, "policy": "interrupt", "say": "伸个懒腰，舒服~"},
+    {"name": "forward",   "desc": "向前走两步", "cmd": "action.run", "args": {"group": 8,  "times": 1}, "policy": "interrupt", "say": "我往前走两步！"},
+    {"name": "back",      "desc": "后退两步",   "cmd": "action.run", "args": {"group": 9,  "times": 1}, "policy": "interrupt", "say": "那我退后一点。"},
+    {"name": "turn_left", "desc": "向左转",     "cmd": "action.run", "args": {"group": 10, "times": 1}, "policy": "interrupt", "say": "往左转！"},
+    {"name": "turn_right","desc": "向右转",     "cmd": "action.run", "args": {"group": 11, "times": 1}, "policy": "interrupt", "say": "往右转！"},
+    {"name": "bark",      "desc": "叫一声",     "cmd": "action.run", "args": {"group": 12, "times": 1}, "policy": "interrupt", "say": "汪汪！"}
+  ]
+}

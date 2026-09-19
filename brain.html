@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗 · 大模型决策调试台</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --accent2: #0f9d58;
+    --warn: #d97706; --bad: #dc2626; --ok: #0f9d58; --busy: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  header a { color: var(--accent); text-decoration: none; }
+  .wrap { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 1000px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; }
+  .card h3 { margin: 14px 0 6px; font-size: 13px; color: var(--ink); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, select, textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line);
+    border-radius: 7px; font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 130px; }
+  button { cursor: pointer; border: none; border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    font-weight: 600; color: #fff; background: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: #eef2ff; color: var(--accent); }
+  button.green { background: var(--accent2); }
+  button.warn { background: var(--warn); }
+  button.red { background: var(--bad); }
+  button.lite { background: #eef2ff; color: var(--accent); font-weight: 600; }
+  button.tiny { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .t-ok { background: #dcfce7; color: var(--ok); }
+  .t-bad { background: #fee2e2; color: var(--bad); }
+  .t-warn { background: #fef3c7; color: var(--warn); }
+  .t-info { background: #eef2ff; color: var(--accent); }
+  .t-busy { background: #ede9fe; color: var(--busy); }
+  .empty { color: var(--muted); padding: 12px 4px; font-size: 12px; }
+  .pill { font-size: 12px; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv div:nth-child(odd) { color: var(--muted); font-size: 12px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  pre.box { background: #0f172a; color: #d1e0ff; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; border-radius: 8px; padding: 10px; max-height: 240px; overflow: auto;
+    white-space: pre-wrap; margin: 6px 0 0; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; font-size: 12px; color: var(--accent); font-weight: 600; }
+  .say { font-size: 15px; font-weight: 600; color: var(--ink); background: #f1f5fb;
+    border-left: 3px solid var(--accent); padding: 8px 10px; border-radius: 0 7px 7px 0; margin-top: 8px; }
+  .checks { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .chip { background: #eef2ff; color: var(--accent); border-radius: 999px; padding: 2px 9px;
+    font-size: 11px; font-weight: 600; cursor: pointer; border: none; }
+  #log { background: #0f172a; color: #d1e0ff; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; border-radius: 8px; padding: 10px; height: 170px; overflow: auto; white-space: pre-wrap; }
+  .portsel { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .portsel .pbtn { background:#eef2ff; color:var(--accent); border:1px solid #dbe3ff; border-radius:6px;
+    padding:4px 10px; cursor:pointer; font-size:12px; font-weight:600; }
+  .portsel .pbtn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .portsel .pin { width:80px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; }
+  .portsel .pgo { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:4px 12px;
+    cursor:pointer; font-weight:600; font-size:12px; }
+  .portsel .pinfo { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>机器狗 · 大模型决策调试台</h1>
+  <div class="sub">看模型给什么、怎么解析、要不要动作 —— <b>预演模式</b>只问模型不下发，狗不会动；<b>执行模式</b>才真的让它说和做。</div>
+  <div class="sub" style="margin-top:8px;">
+    <a href="/">← 服务台主页</a> · <a href="/ctrl">设备控制 / OTA 台</a> · <a href="/voice">语音监测台</a>
+  </div>
+</header>
+
+<div class="wrap">
+  <!-- 左：对话调试 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+
+    <div class="card">
+      <h2>模型运行状态</h2>
+      <div class="kv" id="statBox"><div>读取中…</div></div>
+      <div class="btnrow">
+        <button class="lite" id="statRefresh">刷新状态</button>
+        <button class="ghost" id="pingBtn">连通自检</button>
+        <button class="lite" id="reloadBtn">重读动作清单</button>
+      </div>
+      <div class="pill" id="pingOut" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>一句话调试</h2>
+      <div class="row">
+        <div><label>设备 ID（决定用哪份对话历史；预演填 debug 即可）</label>
+          <input id="device" value="debug" /></div>
+        <div><label>Token（Bearer）</label><input id="token" value="dev-token-change-me" /></div>
+      </div>
+      <label>主人说的话</label>
+      <textarea id="text" style="min-height:56px;">坐下</textarea>
+      <div class="chips" id="quick"></div>
+      <div class="btnrow">
+        <button class="green" id="dryBtn">预演（只问模型，不下发）</button>
+        <button class="warn" id="runBtn">执行（真的让狗说+做）</button>
+        <button class="ghost" id="clearBtn">清空该设备历史</button>
+      </div>
+
+      <div id="result" style="margin-top:12px;">
+        <div class="empty">结果会显示在这里：模型原始返回、解析后的台词/表情/动作、耗时体检。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>批量回归（连跑 6 句，全走预演）</h2>
+      <div class="pill">一句话最怕三种翻车：不说话（哑巴）、话太长（TTS 拖沓）、编造动作（被白名单拦下）。这里一次跑完，红标就是问题。</div>
+      <div class="btnrow">
+        <button id="batchBtn">开始跑</button>
+        <span class="pill" id="batchState"></span>
+      </div>
+      <table style="margin-top:10px;">
+        <thead><tr><th>输入</th><th>耗时</th><th>台词</th><th>表情/动作</th><th>体检</th></tr></thead>
+        <tbody id="batchBody"><tr><td colspan="5" class="empty">还没跑</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>对话历史（模型串味时看这里）</h2>
+      <div id="histBox" class="mono" style="max-height:200px; overflow:auto;"></div>
+      <div class="btnrow"><button class="lite" id="histRefresh">刷新历史</button></div>
+    </div>
+  </div>
+
+  <!-- 右：配置 + 能力清单 + 日志 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+
+    <div class="card">
+      <h2>连接 / 鉴权</h2>
+      <div>
+        <label>控制服务端口</label>
+        <div class="portsel">
+          <button class="pbtn" data-port="8000">8000</button>
+          <button class="pbtn" data-port="8001">8001</button>
+          <input id="portInput" class="pin" type="number" min="1" max="65535" placeholder="其他" />
+          <button id="portGo" class="pgo">应用</button>
+          <span id="portState" class="pinfo">页面加载后自动识别</span>
+        </div>
+        <input id="base" value="" style="margin-top:6px;" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>大模型配置（改完热生效，不用重启）</h2>
+      <div class="row">
+        <div><label>平台</label>
+          <select id="prov">
+            <option value="zhipu">智谱 GLM（glm-4-flash 免费）</option>
+            <option value="bailian">阿里百炼 Qwen</option>
+            <option value="siliconflow">硅基流动</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="custom">自定义 OpenAI 兼容端点</option>
+          </select>
+        </div>
+        <div><label>模型名</label><input id="model" placeholder="glm-4-flash" /></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><label>API Key（留空=不修改已保存的 Key）</label>
+          <input id="key" type="password" placeholder="sk-..." /></div>
+      </div>
+      <div id="customRow" class="row" style="margin-top:8px; display:none;">
+        <div><label>自定义 base_url</label><input id="baseUrl" placeholder="https://your.endpoint/v1" /></div>
+      </div>
+      <div class="btnrow">
+        <button id="saveCfg">保存并生效</button>
+        <button class="lite" id="showKey">显示 Key</button>
+      </div>
+      <div class="pill" id="cfgOut" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>能力清单（dog_actions.json）</h2>
+      <div class="pill" id="persona"></div>
+      <h3>动作（模型只能从这里挑）</h3>
+      <table>
+        <thead><tr><th>name</th><th>说明</th><th>兜底台词</th></tr></thead>
+        <tbody id="actBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
+      </table>
+      <h3>表情</h3>
+      <div class="chips" id="faces"></div>
+      <h3>规则</h3>
+      <div class="mono" id="rules" style="max-height:160px; overflow:auto; color:var(--muted);"></div>
+    </div>
+
+    <div class="card">
+      <h2>事件日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg) => {
+  const el = $("log");
+  el.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+const base = () => $("base").value.replace(/\/+$/, "");
+const headers = () => ({ "Content-Type": "application/json",
+  "Authorization": "Bearer " + $("token").value.trim() });
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
+  (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+
+async function api(method, path, body) {
+  try {
+    const res = await fetch(base() + path, { method, headers: headers(),
+      body: body ? JSON.stringify(body) : undefined });
+    let data = null;
+    try { data = await res.json(); } catch (e) {}
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { error: String(e) } };
+  }
+}
+
+// ---------- 端口自动识别 ----------
+function applyPort(p, silent) {
+  p = parseInt(p, 10);
+  if (!p || p < 1 || p > 65535) return;
+  $("base").value = `http://${location.hostname}:${p}`;
+  $("portInput").value = p;
+  document.querySelectorAll(".portsel .pbtn").forEach(b =>
+    b.classList.toggle("active", parseInt(b.dataset.port, 10) === p));
+  if (!silent) { $("portState").textContent = "已切到 " + $("base").value; refreshAll(); }
+}
+$("portGo").addEventListener("click", () => applyPort($("portInput").value));
+document.querySelectorAll(".portsel .pbtn").forEach(b =>
+  b.addEventListener("click", () => applyPort(b.dataset.port)));
+fetch("/api/v1/info").then(r => r.json()).then(j => {
+  applyPort((j && j.http_port) || parseInt(location.port || "8000", 10), true);
+  if (j && j.http_port) $("portState").textContent = "已自动识别控制端口 " + j.http_port;
+}).catch(() => applyPort(parseInt(location.port || "8000", 10), true));
+
+// ---------- 状态 ----------
+async function refreshStatus() {
+  const r = await api("GET", "/api/v1/brain/status");
+  const box = $("statBox");
+  if (!r.ok || !r.data || !r.data.brain) {
+    box.innerHTML = `<div>读取失败</div><div class="err">[${r.status}] ${esc(JSON.stringify(r.data))}</div>`;
+    return null;
+  }
+  const b = r.data.brain;
+  const ready = b.ready && b.enabled;
+  const tag = ready ? '<span class="tag t-ok">就绪</span>'
+    : (b.enabled ? '<span class="tag t-warn">未配 Key</span>'
+                 : '<span class="tag t-bad">未启用（DOG_BRAIN=1）</span>');
+  box.innerHTML = `
+    <div>状态</div><div>${tag}${b.error ? " <span class='pill'>" + esc(b.error) + "</span>" : ""}</div>
+    <div>平台 / 模型</div><div class="mono">${esc(b.provider || "—")} / ${esc(b.model || "—")}</div>
+    <div>端点</div><div class="mono">${esc(b.base_url || "—")}</div>
+    <div>API Key</div><div class="mono">${b.key_set ? "已填写（不回显）" : "未填写"}</div>
+    <div>动作 / 表情</div><div>${(b.actions || []).length} 个动作 · ${(b.faces || []).join("、") || "—"}</div>
+    <div>人设</div><div>${esc((b.persona || "").slice(0, 60))}${(b.persona || "").length > 60 ? "…" : ""}</div>
+    <div>配置文件</div><div class="mono">${esc(b.config_file || "—")}</div>`;
+  return b;
+}
+
+// ---------- 配置 ----------
+async function loadConfig() {
+  const r = await api("GET", "/api/v1/brain/config");
+  if (!r.ok || !r.data) { $("cfgOut").textContent = "读取配置失败"; return; }
+  const c = r.data.config;
+  $("prov").value = c.provider || "zhipu";
+  $("model").value = c.model || "";
+  $("baseUrl").value = (c.provider === "custom") ? (c.base_url || "") : "";
+  toggleCustom();
+}
+function toggleCustom() {
+  $("customRow").style.display = ($("prov").value === "custom") ? "flex" : "none";
+}
+$("prov").addEventListener("change", () => {
+  toggleCustom();
+  const preset = { zhipu: "glm-4-flash", bailian: "qwen-plus",
+                   siliconflow: "Qwen/Qwen2.5-7B-Instruct", deepseek: "deepseek-chat" };
+  if (preset[$("prov").value]) $("model").value = preset[$("prov").value];
+});
+$("saveCfg").addEventListener("click", async () => {
+  const body = { provider: $("prov").value, model: $("model").value.trim(),
+                 api_key: $("key").value.trim() };
+  if ($("prov").value === "custom") body.base_url = $("baseUrl").value.trim();
+  const r = await api("POST", "/api/v1/brain/config", body);
+  if (r.ok) {
+    const c = r.data.config;
+    $("cfgOut").innerHTML = `已写入 <span class="mono">${esc(c.config_file)}</span>：`
+      + `${esc(c.provider)} / ${esc(c.model)} · ${c.ready ? '<span class="tag t-ok">就绪</span>'
+        : '<span class="tag t-bad">还差点东西</span>'}（下次调用即生效）`;
+    log(`配置已更新：${c.provider}/${c.model} ready=${c.ready}`);
+    $("key").value = "";
+    refreshStatus(); loadCaps();
+  } else {
+    $("cfgOut").innerHTML = `<span class="tag t-bad">保存失败</span> ${esc(JSON.stringify(r.data))}`;
+  }
+});
+$("showKey").addEventListener("click", () => {
+  $("key").type = ($("key").type === "password") ? "text" : "password";
+});
+
+// ---------- 连通自检 / 重读清单 ----------
+$("pingBtn").addEventListener("click", async () => {
+  $("pingOut").textContent = "正在自检（问模型一句最简短的话）…";
+  const r = await api("POST", "/api/v1/brain/ping", {});
+  const d = r.data || {};
+  if (d.ok) {
+    $("pingOut").innerHTML = `<span class="tag t-ok">通</span> ${esc(d.provider)}/${esc(d.model)} · `
+      + `${d.latency_ms} ms · 回了一句「${esc(d.preview)}」`;
+    log(`连通自检通过 ${d.latency_ms}ms`);
+  } else {
+    $("pingOut").innerHTML = `<span class="tag t-bad">不通</span> ${esc(d.error || JSON.stringify(d))}`;
+    log("连通自检失败：" + (d.error || JSON.stringify(d)));
+  }
+});
+$("reloadBtn").addEventListener("click", async () => {
+  const r = await api("POST", "/api/v1/brain/reload", {});
+  log(r.ok ? `已重读动作清单：${(r.data.actions || []).join("、")}` : "重读失败：" + JSON.stringify(r.data));
+  loadCaps(); refreshStatus();
+});
+$("statRefresh").addEventListener("click", () => { refreshStatus(); loadCaps(); });
+
+// ---------- 能力清单 ----------
+async function loadCaps() {
+  const r = await api("GET", "/api/v1/brain/caps");
+  if (!r.ok || !r.data || !r.data.caps) {
+    $("actBody").innerHTML = `<tr><td colspan="3" class="empty">读取失败</td></tr>`;
+    return;
+  }
+  const c = r.data.caps;
+  $("persona").textContent = c.persona || "（未设人设）";
+  $("actBody").innerHTML = (c.actions || []).map(a =>
+    `<tr><td class="mono">${esc(a.name)}</td><td>${esc(a.desc || "")}</td>`
+    + `<td>${esc(a.say || "")}</td></tr>`).join("")
+    || `<tr><td colspan="3" class="empty">动作清单为空，模型只能说话不能动</td></tr>`;
+  $("faces").innerHTML = (c.faces || []).map(f =>
+    `<span class="chip">${esc(f)}</span>`).join("") || '<span class="empty">无</span>';
+  $("rules").innerHTML = (c.rules || []).map((x, i) => `${i + 1}. ${esc(x)}`).join("<br>");
+}
+
+// ---------- 快捷语料 ----------
+const QUICK = ["坐下", "握个手", "往前走两步", "叫一声", "今天天气怎么样", "给我翻个跟头", "你好呀"];
+$("quick").innerHTML = QUICK.map(q => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("");
+$("quick").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-q]");
+  if (b) $("text").value = b.dataset.q;
+});
+
+// ---------- 结果渲染 ----------
+function health(res) {
+  const d = res.debug || {};
+  const ms = d.latency_ms || 0;
+  const len = (res.reply || "").length;
+  const maxLen = 30;
+  const out = [];
+  out.push(res.reply ? '<span class="tag t-ok">有台词</span>'
+                     : '<span class="tag t-bad">哑巴（没台词）</span>');
+  out.push(ms < 3000 ? `<span class="tag t-ok">${ms} ms</span>`
+                     : `<span class="tag t-warn">${ms} ms 偏慢</span>`);
+  out.push(len <= maxLen ? `<span class="tag t-ok">${len} 字</span>`
+                         : `<span class="tag t-warn">${len} 字 偏长</span>`);
+  out.push(d.path === "tool_calls" ? '<span class="tag t-info">走了工具</span>'
+                                   : '<span class="tag t-warn">纯文本降级</span>');
+  if ((res.rejected || []).length) out.push(`<span class="tag t-bad">编造动作已拦下</span>`);
+  return `<div class="checks">${out.join("")}</div>`;
+}
+
+function renderResult(res, mode) {
+  const d = res.debug || {};
+  const ex = res.executed || {};
+  const acts = (res.actions || []).map(a => `<span class="tag t-info">${esc(a)}</span>`).join(" ")
+    || '<span class="pill">无</span>';
+  const rej = (res.rejected || []).length
+    ? (res.rejected || []).map(a => `<span class="tag t-bad">${esc(a)}</span>`).join(" ") : "";
+  const exec = mode === "dry" ? '<span class="pill">预演模式未下发</span>' : [
+    ex.speak ? `<span class="tag t-ok">播报成功</span>` : (res.reply ? `<span class="tag t-bad">播报失败</span>` : ""),
+    ex.face ? `<span class="tag t-ok">表情 ${esc(ex.face)}</span>` : "",
+    (ex.actions || []).length ? `<span class="tag t-ok">动作 ${esc((ex.actions || []).join("、"))}</span>` : "",
+    ex.repair ? `<span class="tag t-warn">补话：${esc(ex.repair)}</span>` : "",
+  ].join(" ");
+  const notes = (d.notes || []).length
+    ? `<div class="pill" style="margin-top:8px;">兜底路径：${(d.notes || []).map(esc).join(" ｜ ")}</div>` : "";
+
+  $("result").innerHTML = `
+    ${health(res)}
+    <div class="say">${res.reply ? esc(res.reply) : "（没有台词）"}</div>
+    <div class="kv" style="margin-top:10px;">
+      <div>表情</div><div>${res.face ? `<span class="tag t-info">${esc(res.face)}</span>` : '<span class="pill">无</span>'}</div>
+      <div>动作</div><div>${acts} ${rej}</div>
+      <div>执行</div><div>${exec}</div>
+      <div>模型</div><div class="mono">${esc(res.provider || "—")} / ${esc(res.model || "—")}</div>
+    </div>
+    ${notes}
+    <details><summary>模型原始返回（tool_calls / 正文）</summary>
+      <pre class="box">正文：${esc(d.raw_content || "（空）")}\n\ntool_calls：${esc(JSON.stringify(d.raw_tool_calls || [], null, 2))}</pre>
+    </details>
+    <details><summary>发给模型的完整消息（含系统提示词 & 历史）</summary>
+      <pre class="box">${esc(JSON.stringify(d.messages || [], null, 2))}</pre>
+    </details>`;
+}
+
+async function ask(mode) {
+  const did = $("device").value.trim() || "debug";
+  const text = $("text").value.trim();
+  if (!text) { log("请输入要说的话"); return; }
+  const btn = mode === "dry" ? $("dryBtn") : $("runBtn");
+  btn.disabled = true;
+  $("result").innerHTML = `<div class="empty">${mode === "dry" ? "预演中" : "执行中"}…（等模型回话，一般 1-3 秒）</div>`;
+  const r = mode === "dry"
+    ? await api("POST", "/api/v1/brain/test", { device_id: did, text })
+    : await api("POST", "/api/v1/brain/say", { device_id: did, text, wait: true });
+  btn.disabled = false;
+  if (r.ok && r.data && r.data.ok) {
+    renderResult(r.data, mode);
+    log(`${mode === "dry" ? "预演" : "执行"}「${text}」-> ${(r.data.debug || {}).latency_ms}ms`
+      + ` 说：${r.data.reply} 动作：${(r.data.actions || []).join("、") || "无"}`);
+  } else {
+    $("result").innerHTML = `<div class="empty"><span class="tag t-bad">失败</span> `
+      + `[${r.status}] ${esc(JSON.stringify(r.data))}</div>`;
+    log(`失败 [${r.status}] ${JSON.stringify(r.data)}`);
+  }
+  refreshHistory();
+}
+$("dryBtn").addEventListener("click", () => ask("dry"));
+$("runBtn").addEventListener("click", () => ask("run"));
+
+// ---------- 批量回归 ----------
+const CASES = ["坐下", "握个手", "往前走两步", "叫一声", "今天天气怎么样", "给我翻个跟头"];
+$("batchBtn").addEventListener("click", async () => {
+  const b = $("batchBtn");
+  b.disabled = true;
+  $("batchBody").innerHTML = CASES.map(c =>
+    `<tr><td>${esc(c)}</td><td colspan="4" class="empty">跑中…</td></tr>`).join("");
+  const did = $("device").value.trim() || "debug";
+  const rows = [];
+  for (const c of CASES) {
+    $("batchState").textContent = `正在跑：${c}`;
+    const r = await api("POST", "/api/v1/brain/test", { device_id: did, text: c });
+    const d = r.ok ? (r.data || {}) : {};
+    const dbg = d.debug || {};
+    const ms = dbg.latency_ms || 0;
+    const len = (d.reply || "").length;
+    const bad = [];
+    if (!d.reply) bad.push('<span class="tag t-bad">哑巴</span>');
+    if (len > 30) bad.push('<span class="tag t-warn">超长</span>');
+    if (ms >= 3000) bad.push('<span class="tag t-warn">偏慢</span>');
+    if ((d.rejected || []).length) bad.push('<span class="tag t-bad">编造动作</span>');
+    if (dbg.path !== "tool_calls") bad.push('<span class="tag t-warn">纯文本</span>');
+    rows.push(`<tr><td>${esc(c)}</td><td>${ms} ms</td><td>${esc(d.reply || "（无）")}</td>`
+      + `<td>${esc([d.face].filter(Boolean).join("/"))} ${esc((d.actions || []).join("、"))}</td>`
+      + `<td>${bad.length ? bad.join(" ") : '<span class="tag t-ok">正常</span>'}</td></tr>`);
+    $("batchBody").innerHTML = rows.join("");
+  }
+  $("batchState").textContent = "跑完了";
+  b.disabled = false;
+  log("批量回归跑完 " + CASES.length + " 条");
+  refreshHistory();
+});
+
+// ---------- 历史 ----------
+async function refreshHistory() {
+  const did = $("device").value.trim() || "debug";
+  const r = await api("GET", "/api/v1/brain/history?device_id=" + encodeURIComponent(did));
+  const box = $("histBox");
+  if (!r.ok || !r.data) { box.textContent = "读取失败"; return; }
+  const h = r.data.history || [];
+  if (!h.length) { box.innerHTML = `<span class="empty">${esc(did)} 还没有对话历史（预演不写历史）</span>`; return; }
+  box.innerHTML = h.map(m => {
+    const who = m.role === "user" ? "主人" : (m.role === "system" ? "系统" : "狗");
+    return `<div style="margin-bottom:4px;"><b>${who}</b>：${esc(m.content)}</div>`;
+  }).join("");
+}
+$("histRefresh").addEventListener("click", refreshHistory);
+$("clearBtn").addEventListener("click", async () => {
+  const did = $("device").value.trim() || "debug";
+  const r = await api("POST", "/api/v1/brain/history/clear", { device_id: did });
+  log(r.ok ? `已清空 ${did} 的历史（${r.data.cleared} 条）` : "清空失败：" + JSON.stringify(r.data));
+  refreshHistory();
+});
+$("device").addEventListener("change", refreshHistory);
+
+function refreshAll() { refreshStatus(); loadCaps(); loadConfig(); refreshHistory(); }
+
+log("调试台已加载。先点「连通自检」确认 Key 能用，再用预演看模型给什么。");
+refreshAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+{
+  "latest": "1.0.1",
+  "note": "app.bin 仅含 idf.bin，不含 bootloader/partition-table/ota_data_initial；size 与 sha256 由服务端自动计算，此处可不填。"
+}
