@@ -1,6 +1,19 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/ 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
+})();
+</script>
+
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>机器狗 · 设备控制 / OTA 管理台</title>
@@ -61,7 +74,7 @@
 <header>
   <h1>机器狗 · 设备控制 / OTA 管理台</h1>
   <div class="sub">HTTP 双向架构 · 端口 <span id="port">8000</span> · 控制台经服务端直推 ESP32 的 <code>/api/v1/command</code>（兼容旧轮询队列）</div>
-  <div class="sub" style="margin-top:8px;"><a href="/" class="homelink">← 返回服务台主页</a></div>
+  <div class="sub" style="margin-top:8px;"><a href="portal.html" class="homelink">← 返回服务台主页</a></div>
 </header>
 
 <div class="wrap">
@@ -69,7 +82,7 @@
   <div style="display:flex; flex-direction:column; gap:16px;">
     <div class="card">
       <h2>设备总览（每 3 秒刷新）</h2>
-      <div class="pill" style="margin-bottom:8px;">显示“—”表示该字段板子从未上报：板端需在 <code>hello</code> 或 <code>{"type":"state"}</code> 里带上 <code>fw_version / rssi / free_heap / uptime_sec</code>，服务端才会记录。</div>
+      <div class="pill" style="margin-bottom:8px;">显示“—”表示该字段尚未上报：<code>fw_version</code> 由服务端在握手后主动调 <code>device.status</code> 取回（板端不必改 hello）；<code>rssi / free_heap / psram_free</code> 随板端周期 <code>state</code> 上报。悬停“内存”列可看 PSRAM 与播放欠载计数。</div>
       <table>
         <thead><tr><th>设备</th><th>连接</th><th>来源</th><th>固件</th><th>IP</th><th>RSSI</th><th>Heap</th><th>当前动作</th><th>上报年龄</th></tr></thead>
         <tbody id="devbody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
@@ -280,11 +293,14 @@ async function refresh() {
       ? '<span class="tag t-succeeded">在线</span>'
       : '<span class="tag t-failed">离线</span>';
     const heap = d.free_heap != null ? (d.free_heap / 1000).toFixed(0) + "k" : "—";
+    // 内存/欠载这些细项塞进 title 悬停查看，不给表格加宽度
+    const heapTip = `空闲堆 ${d.free_heap ?? "—"} ｜ PSRAM ${d.psram_free ?? "—"}`
+      + ` ｜ 播放欠载 ${d.playback_underflow_count ?? "—"} ｜ 固件 ${d.fw_version || "—"}`;
     const cur = d.running_slot || (d.busy ? "占用中" : "—");
     return `<tr>
       <td>${d.device_id}</td><td>${conn}</td><td>${SRC_TEXT[d.source] || d.source || "—"}</td>
       <td>${d.fw_version || "—"}</td><td>${d.ip || "—"}</td>
-      <td>${num(d.rssi, "dBm")}</td><td>${heap}</td><td>${cur}</td>
+      <td>${num(d.rssi, "dBm")}</td><td title="${heapTip}">${heap}</td><td>${cur}</td>
       <td>${num(d.age, "s")}</td></tr>`;
   }).join("");
 }

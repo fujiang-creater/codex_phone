@@ -1,6 +1,19 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/ 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
+})();
+</script>
+
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>机器狗 · 大模型决策调试台</title>
@@ -80,7 +93,7 @@
   <h1>机器狗 · 大模型决策调试台</h1>
   <div class="sub">看模型给什么、怎么解析、要不要动作 —— <b>预演模式</b>只问模型不下发，狗不会动；<b>执行模式</b>才真的让它说和做。</div>
   <div class="sub" style="margin-top:8px;">
-    <a href="/">← 服务台主页</a> · <a href="/ctrl">设备控制 / OTA 台</a> · <a href="/voice">语音监测台</a>
+    <a href="portal.html">← 服务台主页</a> · <a href="ctrl.html">设备控制 / OTA 台</a> · <a href="index.html">语音监测台</a>
   </div>
 </header>
 

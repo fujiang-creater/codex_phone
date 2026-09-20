@@ -1,6 +1,19 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/ 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
+})();
+</script>
+
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>机器狗服务台</title>
@@ -42,7 +55,7 @@
   </header>
 
   <div class="grid">
-    <a class="card voice" href="/voice">
+    <a class="card voice" href="index.html">
       <div class="ico">🎙️</div>
       <h2>语音监测台</h2>
       <ul>
@@ -53,7 +66,7 @@
       </ul>
     </a>
 
-    <a class="card ctrl" href="/ctrl">
+    <a class="card ctrl" href="ctrl.html">
       <div class="ico">⚙️</div>
       <h2>OTA 设备控制</h2>
       <ul>
@@ -64,7 +77,7 @@
       </ul>
     </a>
 
-    <a class="card brain" href="/brain">
+    <a class="card brain" href="brain.html">
       <div class="ico">🧠</div>
       <h2>大模型决策调试台</h2>
       <ul>
@@ -75,7 +88,7 @@
       </ul>
     </a>
 
-    <a class="card twin" href="/twin">
+    <a class="card twin" href="twin.html">
       <div class="ico">🐕</div>
       <h2>数字孪生主控台</h2>
       <ul>

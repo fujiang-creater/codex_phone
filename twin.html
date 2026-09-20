@@ -1,6 +1,19 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/ 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
+})();
+</script>
+
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>机器狗 · 数字孪生主控台</title>
@@ -81,7 +94,7 @@
   <h1>机器狗 · 数字孪生主控台</h1>
   <div class="sub">
     孪生、标定与动作组数据存在服务端；步态跑在服务端后台线程，页面关掉也继续走。
-    <a href="/">首页</a> · <a href="/ctrl">设备台</a> · <a href="/brain">模型台</a>
+    <a href="portal.html">首页</a> · <a href="ctrl.html">设备台</a> · <a href="brain.html">模型台</a>
   </div>
   <div class="bar" style="margin-top:10px;">
     <div style="width:220px;"><label style="margin:0 0 4px;">目标设备</label>

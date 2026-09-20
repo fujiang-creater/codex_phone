@@ -1,6 +1,19 @@
 <!DOCTYPE html>
 <html lang="zh">
 <head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/ 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
+})();
+</script>
+
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>机器狗语音识别监测台</title>
@@ -53,7 +66,7 @@
     <span id="mic" class="pill off">麦克风未连接</span>
     <span id="asr" class="pill off">模型未加载</span>
     <span id="portpill" class="pill">WS :—</span>
-    <a class="homelink" href="/">← 返回服务台主页</a>
+    <a class="homelink" href="portal.html">← 返回服务台主页</a>
   </header>
   <div id="portbar" class="portbar">
     <span class="lbl">WS 端口</span>
