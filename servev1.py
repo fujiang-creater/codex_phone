@@ -531,6 +531,29 @@ def write_wav(pcm: bytes, tag: str = ""):
 # ---------------------------------------------------------------------------
 # WebSocket 中枢
 # ---------------------------------------------------------------------------
+def _ws_token_from(req_path, ws):
+    """从 WS 握手请求里取 token：优先 `?token=xxx`，其次 Authorization: Bearer。
+
+    板端 `VOICE_WS_TOKEN` 是空串，握手 URL 里不带 token，所以只会在生产模式
+    （DEVICE_TOKENS 非空）下才真的校验 —— 那时请把它填进板端配置。
+    """
+    import urllib.parse
+    try:
+        if "token=" in (req_path or ""):
+            q = urllib.parse.urlparse(req_path).query
+            v = urllib.parse.parse_qs(q).get("token", [""])[0]
+            if v:
+                return v.strip()
+        hdrs = getattr(getattr(ws, "request", None), "headers", None)
+        if hdrs is not None:
+            auth = (hdrs.get("Authorization", "") if hasattr(hdrs, "get") else "") or ""
+            if auth.lower().startswith("bearer "):
+                return auth[7:].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 async def handler(ws, path=None):
     req_path = getattr(getattr(ws, "request", None), "path", path) or ""
     if "role=xiaozhi" in req_path:
@@ -547,6 +570,19 @@ async def handler(ws, path=None):
         return
     else:
         role = "dash"  # 浏览器不带 role 默认识别为监测端；若收到 hello 则自动升级为 xiaozhi 设备
+
+    # 鉴权：与 HTTP 层 _auth_ok 同一套语义 —— DEVICE_TOKENS 为空 = 开发模式，
+    # 任意 token（含空）放行；配了 token 表 = 生产模式，**设备角色**必须带对 token。
+    # 只卡设备角色（xz/dog/mic，这几条能下发命令），dash 是浏览器监测台不卡，
+    # 否则 `--device-tokens` 一开，页面上的监测台就自己连不上了。
+    # 背景：HTTP 层一直有 _auth_ok，WS 层以前完全没有 —— 端口一暴露出去，
+    # 谁都能连上 xz 角色下发全部 19 条命令（含 OTA、舵机、急停）。
+    if DEVICE_TOKENS and role in ("xz", "dog", "mic"):
+        _tok = _ws_token_from(req_path, ws)
+        if _tok not in DEVICE_TOKENS.values():
+            print(f"[ws] 拒绝鉴权失败的 {role} 连接（token={'有' if _tok else '无'}）", flush=True)
+            await ws.close(1008, "unauthorized")
+            return
 
     clients[role].add(ws)
     print(f"[{role}] 已连接（mic={len(clients['mic'])} xz+dog={len(xz_state)} dash={len(clients['dash'])}）")
@@ -753,6 +789,8 @@ async def xz_handle_hello(ws, j):
             st["device_id"] = did
             WS_DEVICE[ws] = did
             dev_bind_ws(did, ws, session_id=st["session_id"], ip=src_ip)
+            # 板端声明的音频参数记下来：下行 audio_play 必须照它发（见 dev_set_audio）
+            dev_set_audio(did, sr, fd)
             if src_ip:
                 device_endpoint_register(did, src_ip, http_port, auto=True)
                 print(f"[ctrl] 设备 {did} 已登记 -> {src_ip}:{http_port}")
@@ -763,6 +801,10 @@ async def xz_handle_hello(ws, j):
                 print(f"[ctrl] 设备 {did} 上报运行数据 {metrics}", flush=True)
             # OTA 收尾：板端 READY_TO_REBOOT 后会自己重启，重启回来就是这一条 hello
             ota_on_hello(did)
+            # 板端 hello 与周期 state **都不带 fw_version**（只有 device.status 有），
+            # 而服务端从不主动问 -> 控制台那列显示的其实是服务端本地固件表版本。
+            # 这里补一次主动查询，拿到板子实际在跑的版本（异步，不阻塞握手）。
+            _schedule_status_probe(did)
     except Exception:  # noqa: BLE001
         pass
     hello = {
@@ -832,9 +874,12 @@ async def xz_handle_text(ws, message):
             # 控制台就能实时看到下载百分比，而不是只显示一个 "OTA"。
             ota_absorb_report(did, j)
             metrics = pick_metrics(j)
-            # 板端目前不单独发 state 字段，只回 servo_busy / sequence_playing 这类布尔量，
-            # 这里按它推导，省得每来一条就把它打回 IDLE（那会误放掉动作占用，后续命令判空）。
+            # 板端**确实会**在周期上报里带 state 字段，只是用的是自己那套命名
+            # （RECORDING / PLAYING / SEQUENCE / ACTION ...），先经 BOARD_STATE_ALIAS 归一。
+            # 归一后仍不在 DEV_STATES 的（旧固件/只发布尔量的报文），再按布尔量推导，
+            # 省得每来一条就把它打回 IDLE（那会误放掉动作占用，后续命令判空）。
             cur = str(j.get("state") or j.get("mode") or "").upper()
+            cur = BOARD_STATE_ALIAS.get(cur, cur)
             if cur not in DEV_STATES:
                 if j.get("servo_busy") or j.get("sequence_playing"):
                     cur = "MOVING"
@@ -978,6 +1023,17 @@ CTRL_LOCK = threading.Lock()
 #   "UPGRADING" 是服务端自己在 ota_start() 里先占的门禁标；两者语义相同，都要拦命令。
 # ===========================================================================
 DEV_STATES = ("IDLE", "LISTENING", "SPEAKING", "MOVING", "OTA", "UPGRADING", "ERROR", "OFFLINE")
+# ⚠ 板端上报的 state 值域与服务端这张表**不是同一套**（板端 audio_ws.c:163-201）：
+#   板端发 OTA / RECORDING / PLAYING / SEQUENCE / ACTION / MOVING / IDLE。
+#   不归一就会掉进 state 分支的兜底推导被压扁：RECORDING / PLAYING 在"舵机闲着"时
+#   servo_busy 与 sequence_playing 都是 false -> 会被当成 IDLE（控制台显示"空闲"、
+#   半双工判据失效）。这里做一次命名归一：板端保留自己的叫法，服务端只认统一后的。
+BOARD_STATE_ALIAS = {
+    "RECORDING": "LISTENING",   # 服务端半双工判据（录音期间拦播放）认这个名字
+    "PLAYING": "SPEAKING",
+    "SEQUENCE": "MOVING",       # 序列/动作本质都是舵机在动
+    "ACTION": "MOVING",
+}
 STATE_TTL_S = 15.0          # 超过该秒数未上报 -> 判定 OFFLINE（仅在 WS 已断时才生效）
 ACTION_TTL_S = 30.0         # 单个动作占用上限；超时未见板子回报完成则自动释放，避免永久锁死
 OTA_TTL_S = 600.0           # OTA 会话上限（10 分钟）；超时未见终态则判 failed，避免永久门禁
@@ -989,25 +1045,26 @@ FACE_DEFAULT_MS = 5000      # 表情默认持续 5s，播完自动回状态显�
 # 板端可在 hello 或 {"type":"state"} 上报里顺带写的运行数据（有就记，没有就显示 —）
 METRIC_FIELDS = ("fw_version", "free_heap", "psram_free", "rssi", "uptime_sec",
                  "running_slot", "ip")
-# 板端同一项在不同报文里叫法不一样（device.status 里是 free_psram、free_internal），
-# 这里给每个指标列别名，取到后统一按 METRIC_FIELDS 的名字入库，前端只认一套名字。
+# 板端同一项在不同报文里叫法不一样（device.status 里是 free_psram），这里给每个指标列别名，
+# 取到后统一按 METRIC_FIELDS 的名字入库，前端只认一套名字。
+# 注：free_heap 的别名 free_internal 已删——板端 device.status 与周期 state **两个都发
+#     free_heap**，主名必然先命中，别名永不生效（死代码）。
 METRIC_ALIASES = {
     "psram_free": ("free_psram",),
-    "free_heap": ("free_internal",),
     "rssi": ("wifi_rssi",),
     "uptime_sec": ("uptime", "uptime_s", "uptime_ms"),
 }
 # 板端 device.status 里的健康类布尔/计数，顺手收下来，供 UI 或排查用
 METRIC_FLAGS = ("wifi_connected", "servo_busy", "sequence_playing", "audio_ws_ready",
                 "audio_capture", "audio_playback", "playback_buffer_bytes",
-                "playback_dropped_bytes")
+                "playback_dropped_bytes", "playback_underflow_count")
 
 
 def pick_metrics(src):
     """从板端上报（hello / state / device.status）里挑出运行数据并归一字段名。
 
-    板端字段名不统一：device.status 回的是 free_psram / free_internal，而 UI 认的是
-    psram_free / free_heap。在这层做别名映射，板端保持自己现有命名即可。
+    板端字段名不统一：device.status 里 PSRAM 空闲叫 free_psram，而 UI 认 psram_free。
+    在这层做别名映射，板端保持自己现有命名即可。
     """
     if not isinstance(src, dict):
         return {}
@@ -1109,6 +1166,28 @@ def _dev_metrics_sync(device_id, ip=None, metrics=None):
             d["last_heartbeat"] = _ctrl_now_iso()
     except Exception:  # noqa: BLE001
         pass
+
+
+def dev_update_metrics(device_id, ip=None, metrics=None):
+    """只把运行数据并进状态记录，**不动 state / since**。
+
+    与 dev_set_state 的区别：后者每次都 `rec.update({"state":..., "since": now})`，
+    用它来"顺便记个指标"会把"当前状态已持续多久"重置掉。主动探测（device.status）
+    只想补数据，不想扰动状态机，所以走这条。
+    """
+    if not metrics and not ip:
+        return
+    with DEV_LOCK:
+        rec = DEV_STATE.get(device_id) or {}
+        if metrics:
+            m = dict(rec.get("metrics") or {})
+            m.update({k: v for k, v in metrics.items() if v is not None})
+            rec["metrics"] = m
+        if ip:
+            rec["ip"] = ip
+        rec["last_seen"] = time.time()
+        DEV_STATE[device_id] = rec
+    _dev_metrics_sync(device_id, ip=ip, metrics=metrics)
 
 
 def dev_set_state(device_id, state, ip=None, session_id=None, metrics=None):
@@ -1226,6 +1305,34 @@ def _unreported(device_id):
         out["http_port"] = ep.get("port")
         out["source"] = "auto(WS)" if ep.get("auto") else "manual"
     return out
+
+
+# ---------- 音频参数：以板端 hello 声明为准（不再各写一份常量）----------
+def dev_set_audio(device_id, sample_rate=None, frame_duration=None):
+    """记录板端在 hello 里协商到的音频参数。
+
+    服务端下行 audio_play 必须带与板端**完全一致**的 sample_rate / frame_duration，
+    否则板端 `handle_text_message` 会整条静默丢弃（只留一行 UART warning，服务端零感知）。
+    以前这两个值在 `_play_worker` 里硬编码，和板端 `app_config.h` 是两份互不相干的常量；
+    现在统一以板端 hello 的 `audio_params` 为准 —— 板端改帧长，服务端自动跟着走。
+    """
+    if not device_id:
+        return
+    with DEV_LOCK:
+        rec = DEV_STATE.get(device_id) or {}
+        if sample_rate:
+            rec["audio_sr"] = int(sample_rate)
+        if frame_duration:
+            rec["audio_fd"] = int(frame_duration)
+        rec["last_seen"] = time.time()
+        DEV_STATE[device_id] = rec
+
+
+def dev_get_audio(device_id):
+    """取该设备协商到的 (采样率, 帧长ms)；没协商过就退回默认（与板端编译期默认一致）。"""
+    with DEV_LOCK:
+        rec = DEV_STATE.get(device_id) or {}
+    return int(rec.get("audio_sr") or XZ_OPUS_SR), int(rec.get("audio_fd") or XZ_FRAME_MS)
 
 
 def dev_bind_ws(device_id, ws, session_id=None, ip=None):
@@ -1473,6 +1580,51 @@ def ws_command(device_id, command, args=None, mode="async", policy="queue", time
         out["error_code"] = code
         out["retryable"] = err.get("retryable")
     return out
+
+
+# ---------- 握手后主动取一次板端真实状态 ----------
+def _schedule_status_probe(device_id, delay=1.5):
+    """握手后异步问一次 device.status，把板子**实际在跑的**固件版本收进状态表。
+
+    背景：板端 hello 与周期 state 都不带 fw_version（hello 的 JSON 是写死的格式串），
+    只有 device.status 的返回里有（取自 `esp_app_get_description()`），而服务端从不主动问
+    -> 控制台显示的是服务端本地固件表版本，不是板子真实在跑的版本。
+
+    ws_command 是同步阻塞的（threading.Event.wait），直接在 async handler 里调会卡死
+    事件循环，所以丢进 executor 线程执行；整件事异步进行，不影响握手。
+    """
+    async def _run():
+        await asyncio.sleep(delay)          # 等板端处理完 hello、WS 进入就绪
+        loop = asyncio.get_running_loop()
+        try:
+            res = await loop.run_in_executor(
+                None, lambda: ws_command(device_id, "device.status", {},
+                                         mode="sync", policy="queue",
+                                         timeout=5.0, quiet=True))
+        except Exception as e:  # noqa: BLE001
+            print(f"[dev] {device_id} 探测 device.status 异常：{e}", flush=True)
+            return
+        if not res.get("ok"):
+            print(f"[dev] {device_id} 探测 device.status 未成功：{res.get('error')}", flush=True)
+            return
+        reply = res.get("result") or {}
+        data = reply.get("result") or reply.get("data") or {}
+        metrics = pick_metrics(data) or pick_metrics(reply)
+        if not metrics:
+            return
+        dev_update_metrics(device_id, ip=data.get("ip") or None, metrics=metrics)
+        print(f"[dev] {device_id} 真实运行数据已同步（固件 {metrics.get('fw_version') or '?'}"
+              f"，空闲堆 {metrics.get('free_heap')}"
+              f"，欠载 {metrics.get('playback_underflow_count')}）", flush=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 不在事件循环里（例如被自测脚本直接调用）：跳过，不影响主流程。
+        # 注意必须先判再建协程——asyncio.create_task(_run()) 在没有 loop 时抛异常，
+        # 但协程对象已经创建出来了，会留下 "never awaited" 告警。
+        return
+    loop.create_task(_run())
 
 
 # ---------- 优先级调度（服务端门禁 + 板端 policy）----------
@@ -1993,6 +2145,33 @@ def _play_next(device_id):
     th.start()
 
 
+# TTS_HOOK 契约是固定 16000Hz（见 synth_speech 文档）。板端若协商到别的采样率，
+# 送编码前必须先重采样，否则板子听到的是"变速"音频 —— 而且它不会报错。
+TTS_PCM_SR = 16000
+
+
+def _resample_pcm(pcm, src_sr, dst_sr):
+    """int16 单声道 PCM 线性重采样；src==dst 时原样返回（不触发就不花时间）。"""
+    if src_sr == dst_sr or not pcm:
+        return pcm
+    n_src = len(pcm) // 2
+    n_dst = int(n_src * dst_sr / src_sr)
+    if n_dst <= 0:
+        return b""
+    out = bytearray(n_dst * 2)
+    ratio = src_sr / dst_sr
+    for i in range(n_dst):
+        pos = i * ratio
+        i0 = int(pos)
+        i1 = min(i0 + 1, n_src - 1)
+        frac = pos - i0
+        s0 = int.from_bytes(pcm[i0 * 2:i0 * 2 + 2], "little", signed=True)
+        s1 = int.from_bytes(pcm[i1 * 2:i1 * 2 + 2], "little", signed=True)
+        v = max(-32768, min(32767, int(s0 + (s1 - s0) * frac)))
+        out[i * 2:i * 2 + 2] = (v & 0xFFFF).to_bytes(2, "little")
+    return bytes(out)
+
+
 def _play_worker(device_id, item, abort):
     ws = dev_get_ws(device_id)
     if ws is None:
@@ -2007,12 +2186,15 @@ def _play_worker(device_id, item, abort):
             PLAY_CURRENT.pop(device_id, None)
         return
     sid = (DEV_STATE.get(device_id) or {}).get("session_id") or ""
-    sr, fd = 16000, 60
+    # 采样率/帧长必须与板端 hello 协商值逐字相同，否则板端把整条 audio_play 静默丢弃
+    sr, fd = dev_get_audio(device_id)
     samples = sr * fd // 1000
     # 先把音频合成出来再发 start：TTS 可能要 1~3 秒，
     # 否则板子会处在“已通知开始播放、却没有数据”的空窗状态。
     t0 = time.time()
     pcm = synth_speech(item.get("text", ""))
+    if sr != TTS_PCM_SR:      # TTS 契约固定 16k；协商到别的采样率就重采样（见 _resample_pcm）
+        pcm = _resample_pcm(pcm, TTS_PCM_SR, sr)
     print(f"[play] 合成完成 {len(pcm)/2/sr:.2f}s 音频，耗时 {time.time()-t0:.2f}s", flush=True)
     dev_set_state(device_id, "SPEAKING")
     _ws_send_json(ws, {"session_id": sid, "type": "audio_play", "state": "start",
@@ -2351,9 +2533,15 @@ def device_endpoint_register(device_id, host, port=80, token="", auto=True, over
     return True
 
 
-def device_send_command(device_id, command, args=None):
+def device_send_command(device_id, command, args=None, policy=None, mode=None):
     """服务端作为 HTTP 客户端，主动 POST 到 ESP32 的 /api/v1/command（新双向架构）。
-    返回 (ok, payload, status_code)。payload 为 ESP32 的 JSON 回复或错误信息。"""
+    返回 (ok, payload, status_code)。payload 为 ESP32 的 JSON 回复或错误信息。
+
+    policy / mode：板端 `command_policy_is_interrupt(root)` 是在 dispatcher **内部**
+    读 `root.policy` 的 —— 这条 HTTP 通道本来也支持打断语义。以前信封里不带 policy，
+    于是从这里下发的命令永远是 queue，想打断正在跑的序列也打不断。现在透传，
+    与 WS 通道（ws_command）语义一致；mode 不填则板端按缺省 sync 处理。
+    """
     import urllib.request
     ep = DEVICE_ENDPOINTS.get(device_id)
     if not ep:
@@ -2365,6 +2553,10 @@ def device_send_command(device_id, command, args=None):
         "command": command,
         "args": args or {},
     }
+    if policy:
+        envelope["policy"] = policy
+    if mode:
+        envelope["mode"] = mode
     data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if ep.get("token"):
@@ -3209,6 +3401,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     did = tail[:-len("/state")]
                     ota_absorb_report(did, body)
                     stt = str(body.get("state", "IDLE")).upper()
+                    stt = BOARD_STATE_ALIAS.get(stt, stt)   # 与 WS 上报同一条归一规则
                     changed = dev_set_state(did, stt, ip=self.client_address[0])
                     return self._send_json({"ok": True, "device_id": did,
                                             "state": stt, "changed": changed})
@@ -3270,7 +3463,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 command = body.get("command")
                 if not command:
                     return self._send_json({"ok": False, "error": "missing command"}, 400)
-                ok, reply, code = device_send_command(did, command, body.get("args", {}))
+                ok, reply, code = device_send_command(did, command, body.get("args", {}),
+                                                      policy=body.get("policy"),
+                                                      mode=body.get("mode"))
                 return self._send_json({"ok": ok, "device_id": did,
                                         "esp32_status": code, "reply": reply},
                                        200 if ok else 502)
@@ -3351,7 +3546,13 @@ async def main():
     ip_list = local_ips()
     print(f"[server] 本机可用 IP: {', '.join(ip_list) if ip_list else '未能自动获取'}   "
           "ESP32 URL 里请填实际 IP，不要用 localhost/127.0.0.1")
-    async with websockets.serve(handler, "0.0.0.0", PORT):
+    # 心跳显式配置：websockets 库默认 ping_interval=20 / ping_timeout=20。
+    # 板端 esp_websocket_client 在**同一个 task** 里回 pong 与投递数据帧，一旦某个应用
+    # 回调阻塞超过 20s（OTA 写 flash、长舵机序列），服务端就单方面判死断开 ——
+    # 表现为"设备莫名离线"。放宽到 30s/60s：保留死连接检测，又不误杀忙着的板子
+    # （板端另有 30s 周期 state 上报可当存活信号）。
+    async with websockets.serve(handler, "0.0.0.0", PORT,
+                                ping_interval=30, ping_timeout=60):
         await asyncio.Future()  # 永久运行
 
 
