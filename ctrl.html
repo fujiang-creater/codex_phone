@@ -68,6 +68,16 @@
   .portsel .pin { width:80px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; font-size:12px; }
   .portsel .pgo { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:4px 12px; cursor:pointer; font-weight:600; font-size:12px; }
   .portsel .pinfo { font-size:12px; color:var(--muted); }
+  .sw { display:flex; gap:10px; align-items:flex-start; cursor:pointer; font-weight:400; margin:0; }
+  .sw input { position:absolute; width:1px; height:1px; opacity:0; }
+  .sw-track { flex:0 0 auto; width:38px; height:22px; border-radius:999px; background:#cbd5e1;
+    position:relative; transition:background .15s ease; margin-top:1px; }
+  .sw-knob { position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%;
+    background:#fff; transition:left .15s ease; }
+  .sw input:checked + .sw-track { background:var(--accent2); }
+  .sw input:checked + .sw-track .sw-knob { left:19px; }
+  .sw input:focus-visible + .sw-track { outline:2px solid var(--accent); outline-offset:2px; }
+  .sw-text { font-size:12px; color:var(--muted); line-height:1.6; }
 </style>
 </head>
 <body>
@@ -113,7 +123,7 @@
         <div><label>Token（Bearer）</label><input id="token" value="dev-token-change-me" /></div>
       </div>
       <div class="row" style="margin-top:8px;">
-        <div><label>目标设备 ID</label><input id="device" value="esp32s3-001" /></div>
+        <div><label>目标设备 ID</label><input id="device" placeholder="留空 = 自动选在线设备" /></div>
       </div>
     </div>
 
@@ -144,6 +154,16 @@
         <thead><tr><th>设备</th><th>状态</th><th>WS</th><th>当前动作</th><th>播放队列</th><th>上报年龄</th><th>OTA</th></tr></thead>
         <tbody id="stBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
       </table>
+    </div>
+
+    <div class="card">
+      <h2>集群广播（一次下发到所有板子）</h2>
+      <label class="sw">
+        <input type="checkbox" id="clusterSw" />
+        <span class="sw-track"><span class="sw-knob"></span></span>
+        <span class="sw-text">关闭＝点对点，只发上面“目标设备 ID”那一台；打开后，任何一次下发（语音触发的表情／动作／播报、这里的按钮、孪生台的步态）都同时发给所有连着音频 WS 的板子。各台各自过门禁、各自排队，某台忙不影响其他台。</span>
+      </label>
+      <div class="pill" id="clusterInfo" style="margin-top:10px;">读取中…</div>
     </div>
 
     <div class="card">
@@ -282,11 +302,19 @@ async function api(method, path, body) {
 const num = (v, unit) => (v == null || v === "" ? "—" : v + (unit || ""));
 
 async function refresh() {
+  loadCluster();   // 顺手刷新集群开关状态与在线台数（不 await，和下面并行）
   const r = await api("GET", "/api/v1/devices");
   const tb = $("devbody");
   if (!r.ok || !r.data || !r.data.devices.length) {
     tb.innerHTML = `<tr><td colspan="9" class="empty">暂无设备（ESP32 连 <code>?role=dog</code> 的 WS 发 hello 后自动出现）</td></tr>`;
     return;
+  }
+  // 目标设备不再写死 esp32s3-001：留空就自动选中当前在线的那台。
+  // 只填空值 —— 你手动填过的 ID 一律不碰，免得 3 秒轮询把正在输入的内容改掉。
+  const pick = $("device");
+  if (!pick.value.trim()) {
+    const on = r.data.devices.find(d => d.online);
+    if (on) { pick.value = on.device_id; log(`目标设备自动选为在线设备 ${on.device_id}`); }
   }
   tb.innerHTML = r.data.devices.map(d => {
     const conn = d.online
@@ -315,6 +343,7 @@ async function sendCommand(command, args, prio) {
   const r = await api("POST", `/api/v1/devices/${did}/command`, body);
   if (r.ok && r.data && r.data.ok) {
     log(`  成功 P${r.data.priority} policy=${r.data.policy} 回执=${JSON.stringify((r.data.result || {}).data || {})}`, "ok");
+    logCluster(r.data);
   } else {
     log(`  失败 [${r.status}]：${JSON.stringify(r.data)}`, "err");
   }
@@ -411,6 +440,7 @@ document.querySelectorAll("[data-face]").forEach(b => {
     log(`下发表情 ${b.dataset.face} -> ${did}`);
     const r = await api("POST", `/api/v1/devices/${did}/face`, { name: b.dataset.face });
     log(r.ok ? `  表情已显示（5s 后回状态）` : `  失败 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+    logCluster(r.data);
     refreshStates();
   });
 });
@@ -422,6 +452,7 @@ $("playBtn").addEventListener("click", async () => {
   log(`入队播放 -> ${did}：${text}`);
   const r = await api("POST", `/api/v1/devices/${did}/play`, { text });
   log(r.ok ? `  已入队（60ms/帧 节奏下行）` : `  被拒 [${r.status}]：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  logCluster(r.data);
   refreshStates();
 });
 
@@ -430,6 +461,7 @@ $("abortBtn").addEventListener("click", async () => {
   if (!did) { log("请填写目标设备 ID", "err"); return; }
   const r = await api("POST", `/api/v1/devices/${did}/audio/abort`, {});
   log(r.ok ? `  已强制打断，队列已清空` : `  打断失败：${JSON.stringify(r.data)}`, r.ok ? "ok" : "err");
+  logCluster(r.data);
   refreshStates();
 });
 
@@ -506,6 +538,60 @@ $("otaBtn").addEventListener("click", async () => {
 });
 
 $("refreshBtn").addEventListener("click", () => { refreshStates(); refresh(); });
+
+// ---- 集群广播开关（服务端全局开关，落盘 cluster.json）----
+const CL = { enabled: false, targets: [] };
+
+function renderCluster() {
+  const sw = $("clusterSw");
+  if (sw.checked !== CL.enabled) sw.checked = CL.enabled;
+  const ids = CL.targets || [];
+  $("clusterInfo").innerHTML = CL.enabled
+    ? `已开启 · 当前 <b>${ids.length}</b> 台在线将同时接收：`
+      + (ids.map(x => `<code>${x}</code>`).join(" ") || "（暂无在线设备）")
+    : `已关闭 · 点对点下发（只发“目标设备 ID”那一台；当前在线 ${ids.length} 台）`;
+}
+
+async function loadCluster() {
+  const r = await api("GET", "/api/v1/cluster");
+  if (!r.ok || !r.data || r.data.ok === false) {
+    $("clusterInfo").textContent = "集群接口不可用（服务端未更新？）";
+    return;
+  }
+  CL.enabled = !!r.data.enabled;
+  CL.targets = r.data.targets || [];
+  renderCluster();
+}
+
+function logCluster(d) {
+  const c = d && d.cluster;
+  if (!c || !c.targets) return;
+  if (c.pending) { log(`  集群广播 ${c.targets.length} 台（不等回执）`); return; }
+  const bad = Object.keys(c.failures || {});
+  log(`  集群广播 ${c.targets.length} 台，耗时 ${c.fanout_ms}ms`
+      + (bad.length ? `，${bad.length} 台没成：${bad.join(", ")}` : "，全部成功"),
+      bad.length ? "err" : "ok");
+}
+
+$("clusterSw").addEventListener("change", async () => {
+  const on = $("clusterSw").checked;
+  const n = (CL.targets || []).length;
+  if (on && !confirm(`确认打开集群广播？\n\n此后任何一次下发都会同时发给当前 ${n} 台在线板子`
+                     + `（含语音触发的动作与播报）。`)) {
+    $("clusterSw").checked = CL.enabled;
+    return;
+  }
+  log(`切换集群广播：${on ? "开启" : "关闭"}…`);
+  const r = await api("POST", "/api/v1/cluster", { enabled: on });
+  if (r.ok && r.data && r.data.ok) {
+    CL.enabled = !!r.data.enabled;
+    CL.targets = r.data.targets || [];
+    log(`  集群广播已${CL.enabled ? "开启" : "关闭"}，目标 ${CL.targets.length} 台`, "ok");
+  } else {
+    log(`  切换失败 [${r.status}]：${JSON.stringify(r.data)}`, "err");
+  }
+  renderCluster();
+});
 
 // 初始化
 log("管理台已加载，开始轮询设备…");

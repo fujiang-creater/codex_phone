@@ -17,7 +17,10 @@ PCM 格式：16000 Hz、有符号 int16、小端、单声道、无压缩、无 W
 """
 import argparse
 import asyncio
+import collections
+import concurrent.futures
 import datetime
+import functools
 import json
 import math
 import os
@@ -866,6 +869,12 @@ async def xz_handle_text(ws, message):
         # 板子对 WS 控制指令的回执，唤醒等待中的同步调用
         ws_on_command_result(j)
         return
+    if t == "log":
+        # 板端日志桥（main/log_bridge.c）把 ESP_LOG 的每一行经 WS 送上来，/term 靠它显示。
+        # 和 state 一样属于"板子自说自话"、不需要回执的类型：收到就存，
+        # 缓冲满了丢最旧的（纯内存，服务端重启即清空）。
+        log_absorb(j.get("device_id") or st.get("device_id"), j)
+        return
     if t == "state":
         # 板子周期状态上报（OTA 期间这条路照样通——板端只是丢音频帧，不关 WS）
         did = j.get("device_id") or st.get("device_id")
@@ -1001,6 +1010,8 @@ INDEX_HTML = os.path.join(_SCRIPT_DIR, "index.html")     # 语音监测台（原
 PORTAL_HTML = os.path.join(_SCRIPT_DIR, "portal.html")   # 聚合首页：/ 入口
 BRAIN_HTML = os.path.join(_SCRIPT_DIR, "brain.html")     # 大模型决策调试台
 TWIN_HTML = os.path.join(_SCRIPT_DIR, "twin.html")       # 数字孪生主控台（从板端搬来）
+SDCARD_HTML = os.path.join(_SCRIPT_DIR, "sdcard.html")   # SD 卡文件控制台（板端需有 /api/sd/*）
+TERM_HTML = os.path.join(_SCRIPT_DIR, "term.html")       # 网络日志终端（板端 log_bridge 经 WS 上行）
 DEVICE_TOKENS_FILE = None
 CTRL_DEV_TOKEN = "dev-token-change-me"   # 开发默认 token；生产请改用 --device-tokens 配置
 
@@ -1044,7 +1055,10 @@ FACE_DEFAULT_MS = 5000      # 表情默认持续 5s，播完自动回状态显�
 
 # 板端可在 hello 或 {"type":"state"} 上报里顺带写的运行数据（有就记，没有就显示 —）
 METRIC_FIELDS = ("fw_version", "free_heap", "psram_free", "rssi", "uptime_sec",
-                 "running_slot", "ip")
+                 "running_slot", "ip",
+                 # SD 卡：板端在周期 state 里顺带上报（audio_ws.c），控制台据此判断
+                 # "这台设备有没有卡"。旧固件不发这三个字段 -> 显示为 —，不是错误。
+                 "sd_mounted", "sd_total_kb", "sd_free_kb")
 # 板端同一项在不同报文里叫法不一样（device.status 里是 free_psram），这里给每个指标列别名，
 # 取到后统一按 METRIC_FIELDS 的名字入库，前端只认一套名字。
 # 注：free_heap 的别名 free_internal 已删——板端 device.status 与周期 state **两个都发
@@ -1531,6 +1545,258 @@ def ws_on_command_result(j):
               f"message={err.get('message')}", flush=True)
 
 
+# ===========================================================================
+# [C-8] 集群广播：让一次下发同时到所有在线的板子
+#
+# 关闭（默认）时与从前逐字一致：点对点，只发目标设备。
+# 打开时，任何一次"下发"——语音链路的表情 / 动作 / 播报、控制台手动点的命令与
+# 按钮、孪生台的步态与动作组——都会对**当前所有握着音频 WS 的板子**各做一遍：
+# 每台各自过自家门禁、各自入队，跨设备并行、单设备内仍串行。
+#
+# 为什么扇出挂在下发函数这一层，而不是底层 ws_command：
+#   dev_gate 与 DEV_CURRENT 的占用登记都是 per-device 的。若在 ws_command 里复制，
+#   各设备就绕过了自己的门禁与占用登记——一台正在跑动作组的板子会被硬塞新命令，
+#   而服务端还以为它空闲。挂在门禁之上，每台板子才走完整流程。
+# ===========================================================================
+CLUSTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cluster.json")
+CLUSTER_LOCK = threading.Lock()
+CLUSTER_INFO = {"enabled": False, "updated_at": "", "last_targets": []}
+CLUSTER_POOL = None
+CLUSTER_POOL_WORKERS = 16          # 并行扇出靠线程池；实测跨设备并行，单设备内仍串行
+CLUSTER_FUTURE_TIMEOUT = 30.0      # 单台等待上限，超了只记这台失败，不拖住整体
+# 扇出跑在池线程里，而池线程是复用的 —— 标志必须每个任务用完复位，否则下一轮会误判。
+_CLUSTER_TLS = threading.local()
+_CLUSTER_LAST_LOG = {}
+
+
+def cluster_enabled():
+    return bool(CLUSTER_INFO.get("enabled"))
+
+
+def _cluster_in_fanout():
+    """当前线程是否正处在一次扇出里（用来阻断嵌套的二次扇出）。"""
+    return bool(getattr(_CLUSTER_TLS, "fanout", False))
+
+
+def load_cluster_mode():
+    """启动时读 cluster.json；缺失或损坏都当"关闭"（默认点对点，最安全）。"""
+    try:
+        with open(CLUSTER_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        CLUSTER_INFO["enabled"] = bool(data.get("enabled"))
+        CLUSTER_INFO["updated_at"] = str(data.get("updated_at") or "")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[cluster] cluster.json 读取失败，按关闭处理：{e}", flush=True)
+    print(f"[cluster] 集群广播：{'开启' if CLUSTER_INFO['enabled'] else '关闭'}"
+          f"（切换：POST /api/v1/cluster 带 enabled 字段）", flush=True)
+
+
+def save_cluster_mode():
+    try:
+        with open(CLUSTER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": CLUSTER_INFO["enabled"],
+                       "updated_at": CLUSTER_INFO["updated_at"]},
+                      f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        print(f"[cluster] cluster.json 写入失败：{e}", flush=True)
+
+
+def cluster_targets(origin=None):
+    """应当接收广播的设备：所有握着音频 WS 的板子（含发起的那台）。
+
+    发起设备即使不在 WS 列表里也保留，好让它的门禁给出真正的失败原因
+    （离线 / 未绑定），而不是被静默跳过。
+    """
+    with DEV_LOCK:
+        ids = sorted(DEV_WS.keys())
+    if origin and origin not in ids:
+        return [origin] + ids
+    return ids
+
+
+def cluster_status():
+    with DEV_LOCK:
+        ids = sorted(DEV_WS.keys())
+        detail = [{"device_id": d,
+                   "state": (DEV_STATE.get(d) or {}).get("state", "-")} for d in ids]
+    return {"ok": True, "enabled": cluster_enabled(),
+            "updated_at": CLUSTER_INFO.get("updated_at", ""),
+            "targets": ids, "targets_detail": detail,
+            "last_targets": list(CLUSTER_INFO.get("last_targets") or []),
+            "file": CLUSTER_FILE}
+
+
+def set_cluster_mode(enabled):
+    with CLUSTER_LOCK:
+        CLUSTER_INFO["enabled"] = bool(enabled)
+        CLUSTER_INFO["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    save_cluster_mode()
+    status = cluster_status()
+    n = len(status["targets"])
+    print(f"[cluster] 已{'开启' if enabled else '关闭'}："
+          + (f"所有下发将同时到 {n} 台在线板子" if enabled else "恢复点对点下发"),
+          flush=True)
+    if LOOP is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(broadcast_dash({
+                "type": "event",
+                "msg": (f"集群广播已开启：所有下发同时到 {n} 台在线板子" if enabled
+                        else "集群广播已关闭：恢复点对点下发")}), LOOP)
+        except Exception:  # noqa: BLE001
+            pass
+    return status
+
+
+def _cluster_pool():
+    global CLUSTER_POOL
+    with CLUSTER_LOCK:
+        if CLUSTER_POOL is None:
+            CLUSTER_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=CLUSTER_POOL_WORKERS, thread_name_prefix="cluster")
+    return CLUSTER_POOL
+
+
+def _cluster_result_ok(r):
+    if isinstance(r, dict):
+        return bool(r.get("ok"))
+    if isinstance(r, tuple):
+        return bool(r[0]) if r else False
+    return False
+
+
+def _cluster_brief(results):
+    """每台的摘要（不搬板端完整 payload，免得响应体膨胀）。"""
+    out = {}
+    for did, r in results.items():
+        if isinstance(r, dict):
+            res = r.get("result")
+            out[did] = {"ok": bool(r.get("ok")), "error": r.get("error"),
+                        "status": (res or {}).get("status") if isinstance(res, dict) else None}
+        else:
+            out[did] = {"ok": False, "error": repr(r)}
+    return out
+
+
+def _cluster_event(msg):
+    print(msg, flush=True)
+    if LOOP is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                broadcast_dash({"type": "event", "msg": msg}), LOOP)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _cluster_throttled(key, msg):
+    """同一 key 最多每秒一条 —— 步态帧是 8~20Hz，不节流会把日志和前端冲爆。"""
+    now = time.time()
+    if now - _CLUSTER_LAST_LOG.get(key, 0) < 1.0:
+        return
+    _CLUSTER_LAST_LOG[key] = now
+    _cluster_event(msg)
+
+
+def cluster_dispatch(label=None, wait=True, hook=None):
+    """下发函数装饰器：集群模式打开时，把这一次调用复制到所有在线板子。
+
+    label  只用于日志/事件；None = 不吭声（给 8~20Hz 的步态帧用）
+    wait   False = 不等各台回执立刻返回（步态帧不能阻塞步态线程）
+    hook   每台真正下发前先调一次 hook(device_id)（孪生用：补上该台的占用登记）
+
+    返回值顶层保持"发起设备"的原样（前端与大脑都不用改），另补三个字段：
+      ok        任意一台成功即 True —— 集群语义下不该因为某台忙就整体报失败
+      cluster   本轮目标 / 每台摘要 / 失败清单 / 耗时
+      origin_ok 发起台自己的结果（它失败而别人成功时，原 error 挪进 origin_error）
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(device_id, *args, **kwargs):
+            if not cluster_enabled() or _cluster_in_fanout():
+                return fn(device_id, *args, **kwargs)
+            targets = cluster_targets(device_id)
+            if len(targets) <= 1:
+                return fn(device_id, *args, **kwargs)
+            t0 = time.time()
+            pool = _cluster_pool()
+
+            def _one(did):
+                # 阻断嵌套扇出：如 P0 急停内部还会调 play_abort，那一次只对自家生效
+                _CLUSTER_TLS.fanout = True
+                try:
+                    if hook is not None:
+                        hook(did)
+                    r = fn(did, *args, **kwargs)
+                    if not wait and label and not _cluster_result_ok(r):
+                        _cluster_throttled(f"{label}.fail",
+                                           f"[cluster] {label} -> {did} 没成功")
+                    return r
+                except Exception as e:  # noqa: BLE001
+                    if not wait and label:
+                        _cluster_throttled(f"{label}.fail",
+                                           f"[cluster] {label} -> {did} 异常：{e}")
+                    return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                finally:
+                    _CLUSTER_TLS.fanout = False     # 池线程复用，必须复位
+
+            if not wait:
+                # 发起台自己那一份留在当前线程跑（返回值必须是真实的），其余丢给池
+                _CLUSTER_TLS.fanout = True
+                try:
+                    for did in targets:
+                        if did != device_id:
+                            pool.submit(_one, did)
+                    if hook is not None:
+                        hook(device_id)
+                    base = dict(fn(device_id, *args, **kwargs) or {})
+                finally:
+                    _CLUSTER_TLS.fanout = False
+                with CLUSTER_LOCK:
+                    CLUSTER_INFO["last_targets"] = targets
+                base["ok"] = bool(base.get("ok"))
+                base["origin_ok"] = base["ok"]
+                base["cluster"] = {"targets": targets, "pending": True,
+                                   "fanout_ms": int((time.time() - t0) * 1000)}
+                return base
+
+            futs = {did: pool.submit(_one, did) for did in targets}
+            results = {}
+            for did, fu in futs.items():
+                try:
+                    results[did] = fu.result(timeout=CLUSTER_FUTURE_TIMEOUT)
+                except Exception as e:  # noqa: BLE001
+                    results[did] = {"ok": False, "error": f"等待结果失败：{e}"}
+            okay = any(_cluster_result_ok(r) for r in results.values())
+            fails = {d: (v.get("error") if isinstance(v, dict) else repr(v))
+                     for d, v in results.items() if not _cluster_result_ok(v)}
+            with CLUSTER_LOCK:
+                CLUSTER_INFO["last_targets"] = targets
+            ms = int((time.time() - t0) * 1000)
+            origin_res = results.get(device_id)
+            if not isinstance(origin_res, dict):
+                origin_res = {"ok": False, "error": "发起设备无结果"}
+            origin_ok = bool(origin_res.get("ok"))
+            base = dict(origin_res)
+            if okay and not origin_ok:
+                base["origin_error"] = base.pop("error", None)
+                base.pop("hint", None)
+            base["origin_ok"] = origin_ok
+            base["ok"] = okay
+            base["cluster"] = {"targets": targets, "ok_any": okay,
+                               "results": _cluster_brief(results),
+                               "failures": fails, "fanout_ms": ms}
+            if label:
+                _cluster_throttled(label,
+                                   f"[cluster] {label} <- {device_id} 广播 {len(targets)} 台"
+                                   f"（{ms}ms）"
+                                   + (f"，{len(fails)} 台没成：{list(fails)[:4]}" if fails
+                                      else "，全部成功"))
+            return base
+        return wrapper
+    return deco
+
+
 def ws_command(device_id, command, args=None, mode="async", policy="queue", timeout=5.0,
                quiet=False):
     """通过已绑定的音频 WS 下发一条 JSON 控制指令。
@@ -1655,6 +1921,7 @@ def _command_hold_ms(command, args):
     return None
 
 
+@cluster_dispatch(label="command")
 def servo_dispatch(device_id, command, args=None, priority=None, policy=None,
                    protect=False, mode=None):
     """优先级调度：服务端门禁 -> 抢占/保护 -> WS 下发。
@@ -1709,6 +1976,7 @@ TWIN_GAIT = None
 TWIN_SEQ = None
 
 
+@cluster_dispatch(wait=False, hook=lambda did: _twin_gait_on_start(did))
 def _twin_gait_dispatch(device_id, servos, move_ms=None):
     """步态单帧下发：直接走 WS，绕开 dev_gate。
 
@@ -1723,13 +1991,45 @@ def _twin_gait_dispatch(device_id, servos, move_ms=None):
                       mode="async", policy="interrupt", quiet=True)
 
 
-def _twin_seq_dispatch(device_id, steps):
+@cluster_dispatch(wait=False, hook=lambda did: _twin_seq_on_start(did))
+def _twin_seq_dispatch(device_id, servos):
+    """动作组单步下发：一条 servo.move 就是板端序列里的一步。
+
+    不用板端 sequence.run 的原因见 twin.SequenceLooper 的类文档（一句话：整组
+    JSON 有 2033 字节，超过板端 WS 接收缓冲的 1024 字节，会被截断成"非法 JSON"）。
+    板端 sequence_task 每步调的就是 send_servo_moves_grouped() -> servo_board_move()，
+    而 servo.move 走的正是这条路径，所以逐步下发与原生序列等价。
+
+    policy=interrupt：和步态帧一致，让新的一步能顶掉上一步没走完的插值（板端
+    servo_board 就是这么设计的，正在走的目标会被下一帧从当前位置接管）。
+    绕开 dev_gate：整组自己就是这台设备的占用者，再走一遍门禁会被自家的 busy 判据挡下。
+    """
     with DEV_LOCK:
         cur = DEV_CURRENT.get(device_id)
         if cur and cur.get("command") == "twin.sequence":
             cur["since"] = time.time()
-    return ws_command(device_id, "sequence.run", {"steps": steps},
-                      mode="async", policy="queue", quiet=True)
+    return ws_command(device_id, "servo.move", {"servos": servos},
+                      mode="async", policy="interrupt", quiet=True)
+
+
+def _twin_clear_cluster_occupancy(origin, cmd):
+    """集群模式下停孪生：其余广播目标的占用登记也要清掉。
+
+    不然广播出去的步态/动作组会在别的板子上一直挂着"动作中"，得等 30 秒看门狗兜底。
+    关闭集群模式时这里什么都不做。
+    """
+    if not cluster_enabled():
+        return
+    ids = [d for d in cluster_targets(origin) if d != origin]
+    with DEV_LOCK:
+        cleared = []
+        for did in ids:
+            cur = DEV_CURRENT.get(did)
+            if cur and cur.get("command") == cmd:
+                DEV_CURRENT.pop(did, None)
+                cleared.append(did)
+    for did in cleared:
+        dev_set_state(did, "IDLE")
 
 
 def _twin_seq_on_start(device_id):
@@ -1747,6 +2047,7 @@ def _twin_seq_on_stop(device_id, reason="user"):
         if cur and cur.get("command") == "twin.sequence":
             DEV_CURRENT.pop(device_id, None)
     dev_set_state(device_id, "IDLE")
+    _twin_clear_cluster_occupancy(device_id, "twin.sequence")
 
 
 def _twin_gait_on_start(device_id):
@@ -1764,6 +2065,7 @@ def _twin_gait_on_stop(device_id, reason="user"):
         if cur and cur.get("command") == "twin.gait":
             DEV_CURRENT.pop(device_id, None)
     dev_set_state(device_id, "IDLE")
+    _twin_clear_cluster_occupancy(device_id, "twin.gait")
 
 
 if twin_mod is not None:
@@ -1813,6 +2115,68 @@ def twin_devices():
         out.append({"device_id": did, "online": did in ws_ids,
                     "state": st.get("state", "OFFLINE"),
                     "ip": st.get("ip") or (DEVICE_ENDPOINTS.get(did) or {}).get("host")})
+    return out
+
+
+# ---- 板端网络日志（main/log_bridge.c 经 WS 上行；/term 的数据源）----
+# 只存内存：服务端一重启就清空，够用，也不会把日志写到盘上越滚越大。
+LOG_BUFFER_LINES = 4000
+DEV_LOGS = {}          # device_id -> {"lines": [...], "total": int, "seq": int,
+                       #               "dropped": int, "at": float, "first_at": float}
+DEV_LOGS_LOCK = threading.Lock()
+
+
+def log_absorb(device_id, j):
+    """收一批板端日志。
+
+    seq 是板端累计写出的行数、dropped 是板端 16KB 环形缓冲溢出的行数——两个一起
+    让 /term 能明确说出"中间丢了东西"，而不是静默地少几行。
+    """
+    if not device_id:
+        return
+    raw = j.get("lines")
+    if not isinstance(raw, list):
+        single = j.get("line")
+        raw = [single] if isinstance(single, str) else []
+    lines = [x for x in raw if isinstance(x, str) and x]
+    if not lines:
+        return
+
+    now = time.time()
+    with DEV_LOGS_LOCK:
+        ent = DEV_LOGS.get(device_id)
+        if ent is None:
+            ent = {"lines": [], "total": 0, "seq": 0, "dropped": 0,
+                   "at": now, "first_at": now}
+            DEV_LOGS[device_id] = ent
+        ent["lines"].extend(lines)
+        ent["total"] += len(lines)
+        if len(ent["lines"]) > LOG_BUFFER_LINES:
+            del ent["lines"][:-LOG_BUFFER_LINES]
+        ent["at"] = now
+        try:
+            ent["seq"] = int(j.get("seq") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            ent["dropped"] = int(j.get("dropped") or 0)
+        except (TypeError, ValueError):
+            pass
+
+
+def log_devices():
+    """/term 顶栏的设备下拉：有日志的都列出，在线状态借用孪生页那份判断。"""
+    with DEV_LOGS_LOCK:
+        snap = {k: {"total": v["total"], "at": v["at"], "dropped": v["dropped"],
+                    "seq": v["seq"]} for k, v in DEV_LOGS.items()}
+    known = {d["device_id"]: d for d in twin_devices()}
+    out = []
+    for did in sorted(snap.keys()):
+        info = known.get(did) or {}
+        out.append({"device_id": did, "online": bool(info.get("online")),
+                    "ip": info.get("ip"), "total": snap[did]["total"],
+                    "dropped": snap[did]["dropped"], "seq": snap[did]["seq"],
+                    "at": snap[did]["at"]})
     return out
 
 
@@ -1923,24 +2287,94 @@ def _beep_pcm():
     return bytes(buf)
 
 
+# 同一句话只合成一次：集群广播会让 N 台板子播同一句，而 edge-tts 一次要 1~3 秒；
+# 各自合成就是 N 次网络请求串起来。这里做缓存 + 单飞（后来者等第一个人的结果），
+# 顺带让"好的""收到"这类重复语句不再重复请求。
+_TTS_CACHE = collections.OrderedDict()      # text -> PCM 字节
+_TTS_CACHE_BYTES = 0
+_TTS_CACHE_LOCK = threading.Lock()
+_TTS_INFLIGHT = {}                          # text -> threading.Event（正在合成）
+_TTS_CACHE_MAX_BYTES = 3 * 1024 * 1024      # 约 3MB：16k 单声道 int16 约 98 秒音频
+_TTS_CACHE_MAX_ITEMS = 24
+_TTS_WAIT_TIMEOUT_S = 30.0
+
+
+def _tts_cache_put(key, pcm):
+    global _TTS_CACHE_BYTES
+    with _TTS_CACHE_LOCK:
+        old = _TTS_CACHE.pop(key, None)
+        if old is not None:
+            _TTS_CACHE_BYTES -= len(old)
+        _TTS_CACHE[key] = pcm
+        _TTS_CACHE_BYTES += len(pcm)
+        while _TTS_CACHE and (_TTS_CACHE_BYTES > _TTS_CACHE_MAX_BYTES
+                              or len(_TTS_CACHE) > _TTS_CACHE_MAX_ITEMS):
+            _, dropped = _TTS_CACHE.popitem(last=False)
+            _TTS_CACHE_BYTES -= len(dropped)
+
+
+def _tts_cache_get(key):
+    with _TTS_CACHE_LOCK:
+        pcm = _TTS_CACHE.get(key)
+        if pcm is not None:
+            _TTS_CACHE.move_to_end(key)
+        return pcm
+
+
 def synth_speech(text):
     """可插拔音源：优先 TTS_HOOK，未接或失败则回退提示音。
 
     TTS_HOOK 契约：fn(text) -> 16000Hz / 单声道 / int16 裸 PCM（不带 WAV 头）。
     返回空或抛异常一律视作合成失败，回退提示音，避免整条播放链路断掉。
+
+    带缓存 + 单飞：同一句话只会真正合成一次，其余调用者等这个结果。
     """
-    if TTS_HOOK is not None:
-        try:
-            pcm = TTS_HOOK(text) or b""
-        except Exception as e:  # noqa: BLE001
-            print(f"[tts] 合成失败，回退提示音：{e}", flush=True)
-            pcm = b""
-        if pcm:
-            # 契约兜底：必须按 2 字节对齐，否则最后一帧会编码失败
-            if len(pcm) % 2:
-                pcm = pcm[: len(pcm) // 2 * 2]
+    key = text or ""
+    pcm = _tts_cache_get(key)
+    if pcm is not None:
+        return pcm
+
+    owner = False
+    with _TTS_CACHE_LOCK:
+        ev = _TTS_INFLIGHT.get(key)
+        if ev is None:
+            ev = threading.Event()
+            _TTS_INFLIGHT[key] = ev
+            owner = True
+    if not owner:
+        # 别人正在合成这句：等它，省掉一次网络请求
+        ev.wait(timeout=_TTS_WAIT_TIMEOUT_S)
+        pcm = _tts_cache_get(key)
+        if pcm is not None:
             return pcm
-    return _beep_pcm()
+        # 对方失败了或等超时：自己接手合成，不让播放链路因为等待而断掉
+        with _TTS_CACHE_LOCK:
+            if _TTS_INFLIGHT.get(key) is None:
+                ev = threading.Event()
+                _TTS_INFLIGHT[key] = ev
+                owner = True
+    try:
+        pcm = b""
+        if TTS_HOOK is not None:
+            try:
+                pcm = TTS_HOOK(text) or b""
+            except Exception as e:  # noqa: BLE001
+                print(f"[tts] 合成失败，回退提示音：{e}", flush=True)
+                pcm = b""
+            if pcm and len(pcm) % 2:
+                # 契约兜底：必须按 2 字节对齐，否则最后一帧会编码失败
+                pcm = pcm[: len(pcm) // 2 * 2]
+        if pcm:
+            _tts_cache_put(key, pcm)
+            return pcm
+        # 未接 TTS 或合成失败：回退提示音，但**不入缓存**，免得一次故障被永久记住
+        return _beep_pcm()
+    finally:
+        if owner:
+            with _TTS_CACHE_LOCK:
+                if _TTS_INFLIGHT.get(key) is ev:
+                    _TTS_INFLIGHT.pop(key, None)
+            ev.set()
 
 
 def _load_tts():
@@ -1957,11 +2391,25 @@ def _load_tts():
 
 # ---------------------------------------------------------------------------
 # [C-7] 大脑层：ASR 文本 -> 云端大模型 -> 说话 + 表情 + 动作
-# 默认关闭（设 DOG_BRAIN=1 开启），避免没配 Key 时干扰现有识别流程。
+# 是否启用按三级判定（见 _brain_env_flag / _load_brain）：
+#   DOG_BRAIN=1/true/yes  -> 强制开（还得配好 Key 才真能用）
+#   DOG_BRAIN=0/false/no  -> 强制关
+#   不设（默认）          -> 看 llm_config.json 有没有配好 Key，配好就自动开
+# 之所以不设就自动开：Key 只可能由人主动填进 llm_config.json，填了就是想用。
+# 这样重建环境 / 换机器后不必再记着加环境变量，不会出现"板子连上了但大模型没挂载"。
+# 不想让它开口（例如只想用 --pc-input 做语音输入）就设 DOG_BRAIN=0 明确关掉。
 # ---------------------------------------------------------------------------
+def _brain_env_flag():
+    """读 DOG_BRAIN 的显式意图：True=强制开 / False=强制关 / None=没表态。"""
+    raw = (os.environ.get("DOG_BRAIN") or "").strip().lower()
+    if raw == "":
+        return None
+    return raw not in ("0", "false", "no", "off")
+
+
 BRAIN = None
-BRAIN_ENABLED = str(os.environ.get("DOG_BRAIN", "0")).lower() not in ("", "0", "false", "no")
-BRAIN_INFO = {"enabled": BRAIN_ENABLED, "ready": False}
+BRAIN_ENABLED = _brain_env_flag()          # None 表示留给 _load_brain() 按配置自动判定
+BRAIN_INFO = {"enabled": bool(BRAIN_ENABLED), "ready": False}
 BRAIN_LOCK = threading.Lock()
 
 
@@ -2011,10 +2459,24 @@ def _brain_action(device_id, action_name):
 
 def _load_brain():
     """启动时装配大脑层。缺 Key / 缺包都只是不启用，不影响服务本身。"""
-    global BRAIN, BRAIN_INFO
+    global BRAIN, BRAIN_INFO, BRAIN_ENABLED
+    if BRAIN_ENABLED is None:
+        # 没显式表态 DOG_BRAIN：看一眼 llm_config.json，配好 Key 就自动开。
+        # 这里只读本地配置（不做网络请求），所以不会拖慢启动。
+        try:
+            import llm_cloud
+            BRAIN_ENABLED = bool(llm_cloud.describe().get("ready"))
+        except Exception as e:  # noqa: BLE001
+            BRAIN_ENABLED = False
+            print(f"[brain] 配置探测失败，本次不启用：{e}", flush=True)
+        if BRAIN_ENABLED:
+            print("[brain] 未设 DOG_BRAIN，但 llm_config.json 已配好 Key → 自动启用"
+                  "（想关掉设 DOG_BRAIN=0）", flush=True)
     if not BRAIN_ENABLED:
-        BRAIN_INFO = {"enabled": False, "ready": False,
-                      "reason": "未开启：启动前设 DOG_BRAIN=1"}
+        reason = ("未开启：DOG_BRAIN=0 显式关闭" if _brain_env_flag() is False
+                  else "未开启：没配大模型 Key（在 llm_config.json 填 api_key 即自动启用，"
+                       "或设 DOG_BRAIN=1 强制开启）")
+        BRAIN_INFO = {"enabled": False, "ready": False, "reason": reason}
         return
     try:
         import brain
@@ -2083,21 +2545,23 @@ def _brain_write_config(body):
 def _brain_ping():
     """连通自检：不带工具问一句，验证 Key / 端点 / 模型名。"""
     if BRAIN is None:
-        return {"ok": False, "error": "brain 未启用（启动时设 DOG_BRAIN=1）"}
+        return {"ok": False, "error": "brain 未启用（没配大模型 Key：在 llm_config.json "
+                                      "填 api_key 即自动启用，或设 DOG_BRAIN=1 强制开）"}
     return BRAIN.probe()
 
 
 def _brain_dry_run(device_id, text):
     """预演：走完整决策链路但不下发任何动作/播报，用于调试台看模型到底给了什么。"""
     if BRAIN is None:
-        return {"ok": False, "error": "brain 未启用（启动时设 DOG_BRAIN=1）"}
+        return {"ok": False, "error": "brain 未启用（没配大模型 Key：在 llm_config.json "
+                                      "填 api_key 即自动启用，或设 DOG_BRAIN=1 强制开）"}
     return BRAIN.handle(device_id, text, dry=True)
 
 
 def brain_say(device_id, text, wait=False):
     """把一句话交给大脑。默认后台线程执行，避免阻塞 ASR 队列。"""
     if BRAIN is None:
-        return {"ok": False, "error": "brain 未启用（DOG_BRAIN=1 且配好 LLM_API_KEY）"}
+        return {"ok": False, "error": "brain 未启用（没配大模型 Key，或已被 DOG_BRAIN=0 关闭）"}
     # 实时读配置：llm_config.json 改完立刻生效，不用重启服务
     try:
         import llm_cloud
@@ -2116,6 +2580,7 @@ def brain_say(device_id, text, wait=False):
     return {"ok": True, "async": True}
 
 
+@cluster_dispatch(label="play")
 def audio_play_text(device_id, text):
     """入队一段待播语音；不忙则立即起播。入队前先过门禁，避免放行后才被拒。"""
     ok, reason, hint = dev_gate(device_id, "audio.play.start")
@@ -2231,6 +2696,7 @@ def _play_worker(device_id, item, abort):
     _play_next(device_id)
 
 
+@cluster_dispatch(label="abort")
 def play_abort(device_id):
     """强制打断：立即停当前播放 + 清空队列（急停也走这里）。"""
     with DEV_LOCK:
@@ -2250,6 +2716,7 @@ def play_abort(device_id):
 
 
 # ---------- 表情 ----------
+@cluster_dispatch(label="face")
 def face_show(device_id, name, duration_ms=None):
     if name not in FACES:
         return {"ok": False, "error": "unknown face", "allowed": list(FACES)}
@@ -2343,6 +2810,14 @@ def ota_absorb_report(device_id, msg):
     with DEV_LOCK:
         sess = dict(OTA_SESSION.get(device_id) or {})
         prev = sess.get("phase")
+        if prev is None and not active and board_state in (None, "IDLE"):
+            # 板子的周期 state 帧**永远**带着 ota_state="IDLE" + ota_active=false
+            # （见板端 audio_ws.c：这是"当前没在升级"的意思，不是"有会话但在准备"）。
+            # 以前这里 `phase = prev or "preparing"`，在没有任何会话的情况下也会
+            # 凭空建出一个 preparing 会话 → 板子每次开机，控制台 OTA 面板都会冒出
+            # 一条假的"板端相位 IDLE -> preparing 0%"，掉线后还变成"已中断"。
+            # 所以：没有会话 + 板子说空闲 = 直接放行，什么都不记。
+            return False
         phase = prev or "preparing"
         if board_state:
             if board_state == "IDLE" and not active:
@@ -2519,16 +2994,49 @@ def save_device_endpoints():
 
 
 def device_endpoint_register(device_id, host, port=80, token="", auto=True, overwrite=False):
-    """登记/更新设备端点。auto=True 为 WS 自动注册，默认不覆盖用户手动登记(overwrite=False)。"""
+    """登记/更新设备端点。
+
+    auto=True 表示"由 WS 握手的源 IP 自动登记"。源 IP 是**实时可信**的 —— 板子正拿着
+    这条 WS 连接说话，所以它就是板子此刻的真实地址。据此分三种情况：
+
+    - 原记录是自动的 → 直接覆盖（板子换了 DHCP 地址就跟着换）；
+    - 原记录是**手动**的 → 仍然纠正 host，但保留用户填的 port/token
+      （手动登记通常是为了自定义端口/令牌，不是为了钉住一个会漂的 IP），
+      并把旧值记进 corrected_from / corrected_at 供排查；
+    - overwrite=True（控制台手动登记接口）→ 整条替换，行为不变。
+
+    旧行为是"手动记录一律挡住自动更新"（直接 return False），后果很实在：板子换 IP 后
+    端点表永远停在旧地址，服务端一直拿旧地址去连，页面上就出现"显示的板子 IP 与实际不符"。
+    """
     if not device_id or not host:
         return False
-    cur = DEVICE_ENDPOINTS.get(device_id)
-    if cur and cur.get("auto") is False and not overwrite:
-        return False  # 手动登记优先，自动注册不覆盖
-    DEVICE_ENDPOINTS[device_id] = {
-        "host": host, "port": int(port or 80), "token": token or "",
-        "auto": bool(auto), "last_seen": _ctrl_now_iso(),
-    }
+    cur = DEVICE_ENDPOINTS.get(device_id) or {}
+    if not cur or overwrite:
+        DEVICE_ENDPOINTS[device_id] = {
+            "host": host, "port": int(port or 80), "token": token or "",
+            "auto": bool(auto), "last_seen": _ctrl_now_iso(),
+        }
+        save_device_endpoints()
+        return True
+    old_host = str(cur.get("host") or "")
+    rec = dict(cur)
+    rec["host"] = host
+    if not cur.get("auto"):
+        # 手动登记：IP 跟着板子走，端口/令牌听用户的
+        rec["port"] = int(cur.get("port") or port or 80)
+        rec["token"] = cur.get("token") or token or ""
+        rec["auto"] = False
+        if old_host and old_host != host:
+            rec["corrected_from"] = old_host
+            rec["corrected_at"] = _ctrl_now_iso()
+            print(f"[ctrl] 端点自动纠偏：{device_id} {old_host} -> {host}"
+                  f"（手动登记的 IP 已过期，端口/令牌保留 port={rec['port']}）", flush=True)
+    else:
+        rec["port"] = int(port or cur.get("port") or 80)
+        rec["token"] = token or ""
+        rec["auto"] = True
+    rec["last_seen"] = _ctrl_now_iso()
+    DEVICE_ENDPOINTS[device_id] = rec
     save_device_endpoints()
     return True
 
@@ -2663,11 +3171,18 @@ def ver_sort_key(v):
 # ---------------------------------------------------------------------------
 def load_firmware_index():
     """扫描 firmware/esp32s3/<version>/app.bin，计算 size 与 sha256 建立固件表。
-    可选 firmware/firmware.json: {"latest":"1.0.1"} 指明最新版本（缺省取最大版本号）。"""
+    可选 firmware/firmware.json: {"latest":"1.0.1"} 指明最新版本（缺省取最大版本号）。
+
+    可重复调用：启动时 main() 调一次；入库新固件后由 `POST /api/v1/firmware/reload`
+    再调一次，免去重启服务（FunASR 冷启要 1.5~3 分钟）。
+    """
     import hashlib
-    FIRMWARE.clear()
     os.makedirs(os.path.join(FIRMWARE_DIR, "esp32s3"), exist_ok=True)
     fw_root = os.path.join(FIRMWARE_DIR, "esp32s3")
+    # 先在本地字典里攒好，最后整体换掉 FIRMWARE —— 热重载时别的线程要么看到旧的完整表、
+    # 要么看到新的完整表，不会撞上"清空到一半"的空表（症状是固件列表突然空 / latest 404）。
+    # 所以下面一律写 idx，不要直接写 FIRMWARE。
+    idx = {}
     for name in sorted(os.listdir(fw_root)):
         vdir = os.path.join(fw_root, name)
         binp = os.path.join(vdir, "app.bin")
@@ -2678,12 +3193,12 @@ def load_firmware_index():
                 for chunk in iter(lambda: f.read(65536), b""):
                     h.update(chunk)
             desc = read_app_desc(binp)
-            FIRMWARE[name] = {"device": "esp32s3n16r8", "version": name,
-                              "path": binp, "size": size, "sha256": h.hexdigest(),
-                              "build_version": desc.get("version") or "",
-                              "project_name": desc.get("project_name") or "",
-                              "idf_ver": desc.get("idf_ver") or "",
-                              "mtime": os.path.getmtime(binp)}
+            idx[name] = {"device": "esp32s3n16r8", "version": name,
+                         "path": binp, "size": size, "sha256": h.hexdigest(),
+                         "build_version": desc.get("version") or "",
+                         "project_name": desc.get("project_name") or "",
+                         "idf_ver": desc.get("idf_ver") or "",
+                         "mtime": os.path.getmtime(binp)}
     latest = None
     fj = os.path.join(FIRMWARE_DIR, "firmware.json")
     if os.path.isfile(fj):
@@ -2693,11 +3208,13 @@ def load_firmware_index():
             latest = meta.get("latest")
         except Exception:  # noqa: BLE001
             pass
-    if not latest or latest not in FIRMWARE:
-        vers = sorted(FIRMWARE.keys(), key=ver_sort_key)
+    if not latest or latest not in idx:
+        vers = sorted(idx.keys(), key=ver_sort_key)
         latest = vers[-1] if vers else None
-    FIRMWARE["__latest__"] = latest
-    print(f"[ctrl] 固件表已载入：{len([k for k in FIRMWARE if k != '__latest__'])} 个版本，latest={latest}")
+    idx["__latest__"] = latest
+    FIRMWARE.clear()
+    FIRMWARE.update(idx)
+    print(f"[ctrl] 固件表已载入：{len([k for k in idx if k != '__latest__'])} 个版本，latest={latest}")
 
 
 def load_device_tokens():
@@ -2778,6 +3295,428 @@ def _ctrl_cmd_public(cmd):
 
 
 # ---------------------------------------------------------------------------
+# [C-8] SD 卡文件通道：板端 HTTP /api/sd/* 的代理层（第 6 个控制台 /sdcard）
+#
+# 为什么 SD 全部走 HTTP、一条 WS 指令都不加（改这里的代码前先读这三条板端约束）：
+#   ① 指令回执 result_json 只有 768 字节（command_dispatcher.h:17）——目录列表十几条就超限，
+#      copy_json_result() 会直接返 ESP_ERR_INVALID_SIZE；
+#   ② 板端 WS 只处理「首片且完整」的文本帧（audio_ws.c:637-641），且未设 buffer_size
+#      （默认 1024 字节）——文件内容走 WS 会被分片后静默丢弃；
+#   ③ 板端 HTTP 的 recv_body() 有 16KB 上限且整块 calloc（control_http.c:21/82）
+#      ——所以上传的流式分块必须由板端实现，本层只做透传。
+# 结论：本层只做「路径校验 + 转发 + 流式透传」。文件内容既不落服务端磁盘，也不整块进内存。
+# 板端接口清单见项目根的《SD卡控制台-板端接口清单.md》，字段名必须与那份对齐。
+# ---------------------------------------------------------------------------
+SD_PATH_ROOT = "/sdcard"                  # 板端挂载点（仅用于报错文案）
+SD_MAX_UPLOAD_FALLBACK = 256 * 1024 * 1024  # 板端没报 max_upload_kb 时的兜底上限（256MB）
+SD_IO_CHUNK = 64 * 1024                   # 透传分块大小（上传/下载共用）
+SD_ABORT_GRACE = 5.0                      # 浏览器中断后，等板端回话的宽限期（秒）；详见 sd_put_stream
+SD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+SD_DOS_RESERVED = ({"con", "prn", "aux", "nul"}
+                   | {"com%d" % i for i in range(1, 10)}
+                   | {"lpt%d" % i for i in range(1, 10)})
+
+
+def sd_parse_path(raw):
+    """校验并规范化 SD 相对路径（板端 §2 规则的镜像，这边只防手滑，板端才是权威）。
+
+    返回 (ok, normalized, code, message)；normalized 形如 "/a/b.wav"，根目录为 "/"。
+    只做格式校验，不碰文件系统 —— 存在性一律由板端判定。
+    """
+    if raw is None:
+        return False, "", "SD_INVALID_PATH", "path 必填"
+    p = str(raw).strip()
+    if p in ("", "/"):
+        return True, "/", "", ""
+    if not p.startswith("/"):
+        return False, "", "SD_INVALID_PATH", "path 必须以 / 开头（相对 SD 根）"
+    if p.endswith("/"):
+        return False, "", "SD_INVALID_PATH", "path 不能以 / 结尾"
+    if len(p.encode("utf-8")) > 255:
+        return False, "", "SD_INVALID_PATH", "path 过长（上限 255 字节）"
+    segs = []
+    for seg in p.split("/")[1:]:
+        if seg == "":
+            return False, "", "SD_INVALID_PATH", "path 含空段（连续 //）"
+        if seg in (".", ".."):
+            return False, "", "SD_INVALID_PATH", "path 不允许 . 或 .. 段"
+        try:
+            seg.encode("ascii")
+        except UnicodeEncodeError:
+            return False, "", "SD_UNSUPPORTED_NAME", "首版仅支持英文数字文件名（不支持中文）"
+        if not SD_NAME_RE.match(seg):
+            return False, "", "SD_UNSUPPORTED_NAME", \
+                f"文件名不合法：{seg}（只允许字母数字与 . _ -，且以字母数字开头）"
+        if seg[-1] in (".", "-"):
+            return False, "", "SD_UNSUPPORTED_NAME", f"文件名不能以 . 或 - 结尾：{seg}"
+        if seg.split(".")[0].lower() in SD_DOS_RESERVED:
+            return False, "", "SD_UNSUPPORTED_NAME", f"DOS 保留名不可用：{seg}"
+        segs.append(seg)
+    return True, "/" + "/".join(segs), "", ""
+
+
+def sd_endpoint(device_id):
+    """取板端 HTTP 端点，返回 ((host, port), err)。
+
+    端点由板子在连上音频 WS 时按源 IP + 端口 80 自动登记（device_endpoints.json），
+    所以板子**必须先连上 WS**，否则服务端不知道去哪儿找它的 HTTP。
+    """
+    if not device_id:
+        return None, "没有可用设备：请先让板子连上音频 WS（或指定 device_id）"
+    ep = DEVICE_ENDPOINTS.get(device_id) or {}
+    host = str(ep.get("host") or "").strip()
+    if not host:
+        return None, ("设备端点未知：板子需先连音频 WS 完成 hello，服务端才会按源 IP 自动登记；"
+                      "也可在控制台的设备端点里手动登记")
+    try:
+        port = int(ep.get("port") or 80)
+    except (TypeError, ValueError):
+        port = 80
+    return (host, port), None
+
+
+SD_NOSUPPORT_MSG = ("板端没有这条 /api/sd/* 路由：当前固件不含 SD 接口，"
+                    "需要刷入带 SD 接口的固件")
+
+
+def _sd_parse_json(raw, status):
+    r"""把板端响应体解析成 dict；解析不了时给出可排查的错误。
+
+    关键一步：**404 但错误码不是 SD_ 开头的，一律判为"固件不支持 SD"**。
+    因为板端旧固件的 httpd 没注册 /api/sd/* 时回的是通用 404（可能是纯文本，
+    也可能是别的中间层塞的 JSON），直接透传会变成让人摸不着头脑的 "NOT_FOUND"。
+    而真正的"路径不存在"板端会回 SD_NOT_FOUND（以 SD_ 开头），不受影响。
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        obj = None
+    if isinstance(obj, dict):
+        err = obj.get("error")
+        code = str(err.get("code") or "") if isinstance(err, dict) else ""
+        if status == 404 and not code.startswith("SD_"):
+            return {"ok": False, "error": {"code": "SD_NOT_SUPPORTED",
+                                           "message": SD_NOSUPPORT_MSG}}
+        return obj
+    if status == 404:
+        return {"ok": False, "error": {"code": "SD_NOT_SUPPORTED",
+                                       "message": SD_NOSUPPORT_MSG}}
+    return {"ok": False, "error": {
+        "code": "SD_BAD_RESPONSE",
+        "message": f"板端返回了无法解析的内容（HTTP {status}）"}}
+
+
+def sd_reply(device_id, status, payload):
+    """把板端响应统一成前端要的形状，返回 (obj, http_code)。
+
+    成功：{"ok":true,"device_id":..,"board_status":200,"data":{...}}
+    失败：{"ok":false,"device_id":..,"board_status":503,"code":"SD_NOT_MOUNTED","error":{...}}
+    code 抬到顶层，页面可以直接按 code 分支给不同的图标/文案。
+    """
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        err = payload.get("error")
+        if not isinstance(err, dict):
+            err = {"code": "SD_ERROR", "message": str(err or "板端拒绝，未给原因")}
+        code = err.get("code") or "SD_ERROR"
+        http_code = status if 400 <= status < 600 else 400
+        return ({"ok": False, "device_id": device_id, "board_status": status,
+                 "code": code, "error": err}, http_code)
+    data = payload if isinstance(payload, dict) else {"data": payload}
+    return ({"ok": True, "device_id": device_id, "board_status": status, "data": data},
+            status if 200 <= status < 300 else 200)
+
+
+def _sd_raw_request(host, port, method, uri, timeout=15):
+    """裸 socket 发一次请求，返回 (status_line, body_bytes)。
+
+    只在一个场景里用得上：板端把 HTTP 状态行写坏了（`http.client` 直接抛
+    `BadStatusLine`），但**正文往往是完好的**。这时重新用裸 socket 抓一遍、把正文
+    抠出来，就能把误导人的"连不上板子"还原成板子真正报的错（实测挂卡后板端
+    `/api/sd/info` 就是这个症状，正文是 `SD_IO_ERROR: failed to read SD capacity`）。
+
+    状态行坏了就只能靠第一个空行定位正文，所以这里按 `\\r\\n\\r\\n` 切分。
+    """
+    s = socket.create_connection((host, int(port)), timeout=timeout)
+    try:
+        s.sendall(f"{method} {uri} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                  .encode("ascii"))
+        buf = b""
+        while len(buf) < 65536:
+            try:
+                chunk = s.recv(4096)
+            except (socket.timeout, OSError):
+                break          # 板端常发完就挂着不关连接，收超时即当作读完
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        try:
+            s.close()
+        except Exception:  # noqa: BLE001
+            pass
+    head, _, body = buf.partition(b"\r\n\r\n")
+    line = head.split(b"\r\n")[0].decode("latin-1", "replace") if head else ""
+    return line, body
+
+
+def sd_http_json(device_id, method, uri, timeout=25):
+    """调用板端 SD 小接口（info/list/delete/mkdir/rename），返回 (status, payload)。"""
+    import http.client
+    ep, err = sd_endpoint(device_id)
+    if err:
+        return 502, {"ok": False, "error": {"code": "BOARD_UNREACHABLE", "message": err}}
+    host, port = ep
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request(method, uri)
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read()
+    except http.client.BadStatusLine as e:
+        # 状态行畸形 = 板端把状态行写坏了（正文通常正常）。**不能报"连不上板子"** ——
+        # 那会把排查方向带偏成"网络/网段问题"，实际上是板端那条路由的实现 bug。
+        line, body = "", b""
+        try:
+            line, body = _sd_raw_request(host, port, method, uri, timeout=min(timeout, 15))
+        except Exception:  # noqa: BLE001
+            pass
+        payload = _sd_parse_json(body, 200) if body else None
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            return 502, payload        # 板子自己的错误码更有用，直接透传
+        detail = (line or str(e)).strip()[:120]
+        return 502, {"ok": False, "error": {
+            "code": "BOARD_BAD_RESPONSE",
+            "message": f"板子回了畸形 HTTP 响应：状态行不是 200 OK，而是 {detail!r}。"
+                       f"这不是网络不通，而是板端 {uri} 这条路由把状态行写坏了"
+                       f"（常见于状态行缓冲区越界或格式化串用错），请看板子串口日志"}}
+    except Exception as e:  # noqa: BLE001
+        return 502, {"ok": False, "error": {
+            "code": "BOARD_UNREACHABLE",
+            "message": f"连不上板子 {host}:{port}（{e}）；确认板子在同一网段且 HTTP 服务在跑"}}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return status, _sd_parse_json(raw, status)
+
+
+def sd_open_download(device_id, uri, timeout=60):
+    """打开板端文件下载流，返回 (status, headers, resp, conn) 或 (code, err, None, None)。
+
+    调用方负责 resp.read() 完并 conn.close()。返回直连句柄是本层故意的设计：
+    这样大文件是"浏览器 <- 服务端 <- 板子"的纯流式透传，服务端内存里只有一块 SD_IO_CHUNK。
+    """
+    import http.client
+    ep, err = sd_endpoint(device_id)
+    if err:
+        return 502, {"ok": False, "error": {"code": "BOARD_UNREACHABLE", "message": err}}, None, None
+    host, port = ep
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", uri)
+        resp = conn.getresponse()
+    except Exception as e:  # noqa: BLE001
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return 502, {"ok": False, "error": {
+            "code": "BOARD_UNREACHABLE",
+            "message": f"连不上板子 {host}:{port}（{e}）"}}, None, None
+    if resp.status != 200:
+        raw = resp.read()
+        conn.close()
+        return resp.status, _sd_parse_json(raw, resp.status), None, None
+    return resp.status, dict(resp.getheaders()), resp, conn
+
+
+def sd_put_stream(device_id, uri, length, read_chunk, timeout=300):
+    """把 read_chunk 提供的 length 字节流式转发给板端，返回 (status, payload)。
+
+    真流式：边从浏览器收边往板子发，服务端不落盘、不整块缓存。
+    这样传 256MB 文件时服务端内存占用也只有一块 SD_IO_CHUNK。
+    """
+    import http.client
+    ep, err = sd_endpoint(device_id)
+    if err:
+        return 502, {"ok": False, "error": {"code": "BOARD_UNREACHABLE", "message": err}}
+    host, port = ep
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    send_err = None
+    try:
+        conn.putrequest("POST", uri)
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(length))
+        conn.endheaders()
+        sent = 0
+        try:
+            while sent < length:
+                chunk = read_chunk(length - sent)
+                if not chunk:
+                    break
+                conn.send(chunk)
+                sent += len(chunk)
+            if sent != length:
+                raise OSError(f"浏览器只送来 {sent}/{length} 字节")
+        except Exception as e:  # noqa: BLE001
+            send_err = e
+        if send_err is not None:
+            # 浏览器没把 body 送完。**先对板端半关（发一个 FIN）**，让板子立刻明白
+            # "body 到此为止"：它会走错误分支、清掉半截文件、然后回话。否则板子还在
+            # 死等剩下的字节，而我们紧接着就 getresponse()，两边互等到超时 —— 一次被
+            # 中断的上传能同时占住服务端线程和板子的 HTTP 处理线程好几分钟。
+            try:
+                conn.sock.shutdown(socket.SHUT_WR)
+            except Exception:  # noqa: BLE001
+                pass
+            # 半关 ≠ 立刻回话，只给一个宽限期。超了就按"传输中断"如实报，
+            # 不为了一个错误码再等几百秒。
+            try:
+                conn.sock.settimeout(SD_ABORT_GRACE)
+            except Exception:  # noqa: BLE001
+                pass
+        # 即使发 body 的中途断了，也要尽量把板端的应答收下来：板端很可能早就回绝了
+        # （超限/同名/未插卡都是读完 body 之前就返回），这时把它的真实错误码给用户，
+        # 比笼统一句"传输中断"有用得多。
+        try:
+            resp = conn.getresponse()
+        except Exception as e:  # noqa: BLE001
+            return 502, {"ok": False, "error": {
+                "code": "SD_TRANSFER_FAILED", "message": f"传输中断：{send_err or e}"}}
+        status = resp.status
+        raw = resp.read()
+        parsed = _sd_parse_json(raw, status)
+        if send_err is not None:
+            if 200 <= status < 300:
+                # 板端说成功，但字节没完整送达 —— 绝不能当成功
+                return 502, {"ok": False, "error": {
+                    "code": "SD_TRANSFER_FAILED", "message": f"传输中断：{send_err}"}}
+            # 板端确实回绝了（用它自己的错误码，页面按 code 分支才准），但把"本次还中断了"
+            # 一并写进文案，免得看起来像是板子单方面的问题。
+            e = parsed.get("error")
+            if isinstance(e, dict):
+                e["message"] = f"{e.get('message') or ''}（本次上传中断：{send_err}）"
+    except Exception as e:  # noqa: BLE001
+        return 502, {"ok": False, "error": {
+            "code": "SD_TRANSFER_FAILED", "message": f"传输中断：{e}"}}
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return status, parsed
+
+
+def sd_write_guard(device_id):
+    """写操作前的门禁：只在 OTA 升级期间拦，其余交给转发层自然失败。
+
+    为什么不拦 OFFLINE：板端 HTTP 与音频 WS 是两条**独立**通道，WS 掉线不等于 HTTP 不可达。
+    拦在服务端会把「WS 断了但 HTTP 还通」这种本来能写的情况误拒；而真不可达时
+    转发层会直接回 BOARD_UNREACHABLE，不需要这里再猜一次。
+
+    读操作（列目录、下载）也不调用本函数：SD 走独立 SPI3，与 OTA/舵机/音频都不冲突。
+    """
+    st = dev_get_state(device_id) or {}
+    if st.get("state") in ("UPGRADING", "OTA"):
+        return "设备正在 OTA 升级，暂停 SD 写入（避免与升级抢 CPU/网络）"
+    return ""
+
+
+def sd_upload_caps(device_id):
+    """上传前先探一次板端：返回 (limit_bytes, free_bytes|None, code, msg, status)。
+
+    code 为空 = 拿到上限（板端声明的 max_upload_kb，没有则用兜底值），可以继续传。
+    code 非空 = 这次上传根本不该开始（固件不支持 / 没插卡 / 不可达），
+               调用方应直接把 code/msg/status 透传给前端，**不要退回兜底值硬传** ——
+               传完几百 MB 再报"未插卡"比当场拒绝糟糕得多。
+
+    free_bytes = 剩余空间（板端没报 free_kb 时为 None，调用方应跳过空间预检）。
+    8GB 卡 + 单文件 256MB 的组合下这道预检很值：板子走 20MHz SPI，传 256MB 是
+    分钟级的，等传完再撞 SD_NO_SPACE 是白白浪费几分钟。
+
+    但**空间不是这里说了算**：覆盖写时板端要"原文件 + 新文件"并存（原子替换），
+    峰值占用比 length 大；FATFS 的空闲簇也可能因碎片凑不出连续空间。所以这里只挡
+    "明显塞不下"，最终仍以板端返回的 SD_NO_SPACE 为准。
+
+    info 同时是能力探测入口：这条 404 就说明固件不支持 SD，
+    此时报 SD_NOT_SUPPORTED 比让后续接口各自失败清楚。
+    """
+    status, payload = sd_http_json(device_id, "GET", "/api/sd/info", timeout=10)
+    if status != 200 or not isinstance(payload, dict) or payload.get("ok") is False:
+        if status == 200:
+            return 0, None, "SD_IO_ERROR", "板端 /api/sd/info 返回了无法解析的内容", 502
+        err = payload.get("error") if isinstance(payload, dict) else None
+        code = (err or {}).get("code") or "SD_IO_ERROR"
+        msg = (err or {}).get("message") or f"板端 /api/sd/info 返回 HTTP {status}"
+        return 0, None, code, msg, status if 400 <= status < 600 else 502
+    if payload.get("mounted") is False:
+        return 0, None, "SD_NOT_MOUNTED", "该设备未插 SD 卡", 503
+
+    def _kb(field):
+        """取一个 KB 字段转成字节：字段缺失/非法 -> None；**0 是有效值**（卡真满了）。"""
+        raw = payload.get(field)
+        if raw is None:
+            return None
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return v * 1024 if v > 0 else 0
+
+    limit = _kb("max_upload_kb") or SD_MAX_UPLOAD_FALLBACK
+    free = _kb("free_kb")
+    return limit, free, "", "", 200
+
+
+def sd_stat_remote(device_id, norm_path):
+    """问板端"这个路径在不在"。返回 (ok, info, code, msg, status)。
+
+    ok=True  → info = {"exists": bool, "type": "file"/"dir"/"", "size": int}
+    ok=False → 问不出来（板端没这条路由 / 不可达），**调用方不能当成"不存在"**，
+               否则重名文件会被直接覆盖掉。code/msg/status 说明原因。
+    """
+    import urllib.parse as _up
+    status, payload = sd_http_json(
+        device_id, "GET", "/api/sd/stat?path=" + _up.quote(norm_path, safe=""), timeout=15)
+    if status == 200 and isinstance(payload, dict) and payload.get("ok") is not False:
+        try:
+            size = int(payload.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        ex = bool(payload.get("exists"))
+        return True, {"exists": ex,
+                      "type": (payload.get("type") or "") if ex else "",
+                      "size": size if ex else 0}, "", "", 200
+    err = payload.get("error") if isinstance(payload, dict) else None
+    code = (err or {}).get("code") or "SD_IO_ERROR"
+    msg = (err or {}).get("message") or f"板端未能回答 {norm_path} 是否存在（HTTP {status}）"
+    return False, None, code, msg, (status if 400 <= status < 600 else 502)
+
+
+def sd_truthy(v):
+    """query 参数里的真值判定（overwrite=1/true/yes/on 都算）。"""
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def sd_human_size(n):
+    """把字节数变成人话，用于提示文案（页面另有自己的格式化）。"""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+# ---------------------------------------------------------------------------
 # [C-4] HTTP 路由：ControlHandler（GET/POST 分发 + Bearer 鉴权 + 固件下载）
 # 协议接口见模块 docstring 第 2 项；扩展接口 / 、/ctrl 、/voice 、/api/v1/devices。
 # ---------------------------------------------------------------------------
@@ -2844,6 +3783,56 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _sd_stream_download(self, device_id, norm_path):
+        """SD 下载：浏览器 <- 服务端 <- 板子 的纯流式透传。
+
+        服务端内存里只有一块 SD_IO_CHUNK，文件多大都不落盘、不整块缓存。
+        Content-Length 由板端给；板端没给就不带长度，靠连接关闭表示结束（HTTP/1.0）。
+        """
+        import urllib.parse as _up
+        uri = "/api/sd/file?path=" + _up.quote(norm_path, safe="")
+        status, head, resp, conn = sd_open_download(device_id, uri)
+        if resp is None:
+            obj, code = sd_reply(device_id, status, head)
+            return self._send_json(obj, code)
+        try:
+            total = head.get("Content-Length") or head.get("content-length")
+            name = (norm_path.rsplit("/", 1)[-1] or "download.bin").replace('"', "")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+            if total:
+                self.send_header("Content-Length", str(total))
+            self.end_headers()
+            while True:
+                chunk = resp.read(SD_IO_CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _sd_stream_upload(self, device_id, norm_path, length, overwrite=False):
+        """SD 上传：边从浏览器收边往板子发，服务端不落盘、不整块缓存。
+
+        overwrite=True 时在转发 URI 上带 overwrite=1 —— 板端据此才允许覆盖同名文件，
+        这是"用户已经确认过覆盖"的凭据，服务端不替用户默认打开。
+        """
+        import urllib.parse as _up
+        uri = "/api/sd/file?path=" + _up.quote(norm_path, safe="")
+        if overwrite:
+            uri += "&overwrite=1"
+
+        def _read(n):
+            return self.rfile.read(min(n, SD_IO_CHUNK))
+
+        status, payload = sd_put_stream(device_id, uri, length, _read)
+        obj, code = sd_reply(device_id, status, payload)
+        return self._send_json(obj, code)
+
     def _serve_html(self, path=None):
         path = path or CTRL_HTML
         name = os.path.basename(path)
@@ -2881,6 +3870,33 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         parts = [p for p in path.split("/") if p != ""]
+        # ---- 方法无关：固件热重载（GET/POST 都收，方便 curl 手敲）----
+        # 为什么需要它：固件索引只在 main() 启动时算一次；没这条的话每次拷完新 app.bin 都得重启
+        # 服务（冷启 1.5~3 分钟，还得等板子重连 WS）。放在方法分发**之前**，免得 GET/POST
+        # 两条分支里各写一份、改一处漏一处。
+        if path == "/api/v1/firmware/reload":
+            if not self._auth_ok(None):
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            try:
+                load_firmware_index()
+            except Exception as e:  # noqa: BLE001
+                return self._send_json({"ok": False,
+                                        "error": f"reload failed: {e}"}, 500)
+            return self._send_json(
+                {"ok": True, "latest": FIRMWARE.get("__latest__"),
+                 "versions": [k for k in sorted(FIRMWARE, key=ver_sort_key)
+                              if k != "__latest__"]})
+        # ---- 集群广播开关（GET 看状态 / POST 切换，同路径，仿上面的 firmware/reload）----
+        if path == "/api/v1/cluster":
+            if not self._auth_ok(None):
+                return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+            if self.command and self.command.upper() == "POST":
+                body = self._read_json() or {}
+                if "enabled" not in body:
+                    return self._send_json(
+                        {"ok": False, "error": "enabled 必填（true/false）"}, 400)
+                return self._send_json(set_cluster_mode(bool(body.get("enabled"))))
+            return self._send_json(cluster_status())
         # ===================== DELETE =====================
         if method == "DELETE":
             # /api/v1/device-endpoints/{id}
@@ -2908,6 +3924,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     "device_endpoints": DEVICE_ENDPOINTS,
                     "tts": TTS_NAME,
                     "brain": BRAIN_INFO,
+                    "cluster": cluster_status(),
                 })
             # PC 语音输入运行时开关（仅限本机访问，无需 token）
             #   GET /pc-input/status  查看当前状态
@@ -3119,6 +4136,124 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                     r["device_id"] = did
                     return self._send_json(r, 200 if r.get("ok") else 409)
                 return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+            # ============ SD 卡文件通道（第 6 个控制台 /sdcard）============
+            # 全部转发到板端 HTTP /api/sd/*；为什么不用已有的 WS 指令通道，见上方 [C-8]。
+            # 读接口不受 dev_gate 限制：SD 走独立 SPI3，与舵机/音频互不相干。
+            if path.startswith("/api/v1/sd/"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                import urllib.parse as _up
+                q = _up.parse_qs(parsed.query)
+                sub = path[len("/api/v1/sd/"):]
+                if sub == "devices":
+                    # 页面顶栏的设备下拉：把 state 里的 sd_* 指标 + 端点表并到每台设备上。
+                    # 为什么把"端点"和"设备自报 ip"都给出来：以前页面只拿得到后者，
+                    # 板子换过 DHCP 地址后就说不清"服务端到底连的哪个地址、为什么不一致"。
+                    out = []
+                    for row in twin_devices():
+                        r = dict(row)
+                        st = dev_get_state(r.get("device_id")) or {}
+                        m = st.get("metrics") or {}
+                        r["sd_mounted"] = m.get("sd_mounted")
+                        r["sd_total_kb"] = m.get("sd_total_kb")
+                        r["sd_free_kb"] = m.get("sd_free_kb")
+                        ep = DEVICE_ENDPOINTS.get(r.get("device_id")) or {}
+                        ehost = str(ep.get("host") or "")
+                        eport = int(ep.get("port") or 80)
+                        r["endpoint"] = f"{ehost}:{eport}" if ehost else None
+                        r["endpoint_auto"] = ep.get("auto")
+                        # 显示值（设备自报）≠ 传输值（端点表 host）→ 页面直接标出来
+                        r["ip_mismatch"] = bool(ehost and r.get("ip") and ehost != r.get("ip"))
+                        if ep.get("corrected_from"):
+                            r["endpoint_corrected_from"] = ep["corrected_from"]
+                        out.append(r)
+                    return self._send_json({"ok": True, "devices": out})
+                did = twin_pick_device(q.get("device_id", [""])[0])
+                if not did:
+                    return self._send_json(
+                        {"ok": False, "code": "SD_NO_DEVICE",
+                         "error": {"code": "SD_NO_DEVICE",
+                                   "message": "没有可用设备：请先让板子连上音频 WS（或指定 device_id）"}},
+                        409)
+
+                def _sd_bad(code, msg):
+                    return self._send_json(
+                        {"ok": False, "device_id": did, "code": code,
+                         "error": {"code": code, "message": msg}}, 400)
+
+                if sub == "info":
+                    status, payload = sd_http_json(did, "GET", "/api/sd/info")
+                    obj, code = sd_reply(did, status, payload)
+                    return self._send_json(obj, code)
+                if sub == "list":
+                    okp, norm, code, msg = sd_parse_path(q.get("path", ["/"])[0])
+                    if not okp:
+                        return _sd_bad(code, msg)
+                    status, payload = sd_http_json(
+                        did, "GET", "/api/sd/list?path=" + _up.quote(norm, safe=""))
+                    obj, http_code = sd_reply(did, status, payload)
+                    if obj.get("ok"):
+                        obj["path"] = norm
+                    return self._send_json(obj, http_code)
+                if sub == "stat":
+                    # 重名校验用：只问"在不在"，不传内容。页面在上传/改名之前先问一次。
+                    okp, norm, code, msg = sd_parse_path(q.get("path", [""])[0])
+                    if not okp:
+                        return _sd_bad(code, msg)
+                    if norm == "/":
+                        return _sd_bad("SD_INVALID_PATH", "根目录一定存在，不需要探测")
+                    okq, info, code, msg, bstatus = sd_stat_remote(did, norm)
+                    if not okq:
+                        # 问不出来 ≠ 不存在。**绝不能按"不存在"返回**，否则页面会
+                        # 直接覆盖掉同名文件。这里如实上报，让页面走"无法确认"的提示。
+                        return self._send_json(
+                            {"ok": False, "device_id": did, "code": code,
+                             "error": {"code": code, "message": msg}}, bstatus)
+                    out = {"ok": True, "device_id": did, "path": norm}
+                    out.update(info)
+                    return self._send_json(out)
+                if sub == "download":
+                    okp, norm, code, msg = sd_parse_path(q.get("path", [""])[0])
+                    if not okp:
+                        return _sd_bad(code, msg)
+                    if norm == "/":
+                        return _sd_bad("SD_INVALID_PATH", "下载必须指定具体文件，不能是根目录")
+                    return self._sd_stream_download(did, norm)
+                return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
+            # ---- 网络日志终端 /term 的数据源 ----
+            # 日志是板端经 WS **主动推**上来的，这里只读服务端内存缓冲，不转发板子，
+            # 所以板子离线时仍能看到它断线前最后那些行。
+            # since= 是"已经看到过的总行数"，只回增量，页面 500ms 拉一次也很轻。
+            if path == "/api/v1/logs":
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                q = urllib.parse.parse_qs(parsed.query)
+                did = (q.get("device") or q.get("device_id") or [""])[0].strip()
+                if not did:
+                    did = twin_pick_device("")
+                try:
+                    since = int((q.get("since") or ["0"])[0])
+                except ValueError:
+                    since = 0
+                with DEV_LOGS_LOCK:
+                    ent = DEV_LOGS.get(did)
+                    if ent is None:
+                        buf, total, seq, dropped, at = [], 0, 0, 0, 0.0
+                    else:
+                        buf = list(ent["lines"])
+                        total = ent["total"]
+                        seq = ent["seq"]
+                        dropped = ent["dropped"]
+                        at = ent["at"]
+                oldest = total - len(buf)
+                if since < oldest:
+                    since = oldest       # 更早的行已被挤出缓冲，只能从最旧那行给起
+                if since > total:
+                    since = total
+                return self._send_json({"ok": True, "device": did, "total": total,
+                                        "next": total, "seq": seq, "dropped": dropped,
+                                        "at": at, "lines": buf[since - oldest:],
+                                        "devices": log_devices()})
             # 聚合首页 / 管理页 / 语音监测台
             if path in ("/", "/portal", "/portal.html"):
                 return self._serve_html(PORTAL_HTML)
@@ -3128,11 +4263,147 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                 return self._serve_html(BRAIN_HTML)
             if path in ("/twin", "/twin.html"):
                 return self._serve_html(TWIN_HTML)
+            if path in ("/sdcard", "/sdcard.html"):
+                return self._serve_html(SDCARD_HTML)
+            if path in ("/term", "/term.html"):
+                return self._serve_html(TERM_HTML)
             if path in ("/voice", "/voice.html", "/index.html"):
                 return self._serve_html(INDEX_HTML)
             return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
         # ===================== POST =====================
         if method == "POST":
+            # ============ SD 卡写操作（第 6 个控制台 /sdcard）============
+            # 写操作先过 sd_write_guard：离线 / OTA 中要给人话，别让用户去猜。
+            # 覆盖已有文件由页面先行确认（它手上已有目录列表），服务端只做透传。
+            if path.startswith("/api/v1/sd/"):
+                if not self._auth_ok(None):
+                    return self._send_json({"ok": False, "error": "unauthorized"}, 401)
+                import urllib.parse as _up
+                q = _up.parse_qs(parsed.query)
+                sub = path[len("/api/v1/sd/"):]
+                did = twin_pick_device(q.get("device_id", [""])[0])
+                if not did:
+                    return self._send_json(
+                        {"ok": False, "code": "SD_NO_DEVICE",
+                         "error": {"code": "SD_NO_DEVICE",
+                                   "message": "没有可用设备：请先让板子连上音频 WS（或指定 device_id）"}},
+                        409)
+
+                def _sd_bad(code, msg, http=400):
+                    return self._send_json(
+                        {"ok": False, "device_id": did, "code": code,
+                         "error": {"code": code, "message": msg}}, http)
+
+                if sub == "upload":
+                    okp, norm, code, msg = sd_parse_path(q.get("path", [""])[0])
+                    if not okp:
+                        return _sd_bad(code, msg)
+                    if norm == "/":
+                        return _sd_bad("SD_INVALID_PATH", "上传必须指定文件名，不能是根目录")
+                    try:
+                        length = int(self.headers.get("Content-Length", 0) or 0)
+                    except (TypeError, ValueError):
+                        length = 0
+                    if length <= 0:
+                        return _sd_bad("SD_INVALID_PATH",
+                                       "缺少 Content-Length：上传必须带长度（本转发层是纯流式，不缓存）")
+                    guard = sd_write_guard(did)
+                    if guard:
+                        return _sd_bad("SD_BUSY", guard, 409)
+                    # ---- 能力探测 + 单文件上限 + 剩余空间 ----
+                    # 固件不支持 / 未插卡 / 不可达都在这里当场拒绝，而不是传完几百 MB 再失败
+                    limit, free_b, ccode, cmsg, cstatus = sd_upload_caps(did)
+                    if ccode:
+                        return self._send_json(
+                            {"ok": False, "device_id": did, "code": ccode,
+                             "error": {"code": ccode, "message": cmsg}}, cstatus)
+                    if length > limit:
+                        return _sd_bad(
+                            "SD_TOO_LARGE",
+                            f"单文件上限 {sd_human_size(limit)}，本次 {sd_human_size(length)}",
+                            413)
+                    if free_b is not None and length > free_b:
+                        # 8GB 卡上 256MB 不是小数，而板子 20MHz SPI 传完要几分钟：
+                        # 明显塞不下就当场说，别让用户对着进度条等一场空的。
+                        return _sd_bad(
+                            "SD_NO_SPACE",
+                            f"卡上剩余 {sd_human_size(free_b)}，放不下本次 "
+                            f"{sd_human_size(length)}（覆盖已有文件时峰值占用为原文件加新文件）",
+                            507)
+                    # ---- 重名校验：必须在读 body 之前拦，否则用户白传几百 MB ----
+                    # 页面会先调 /api/v1/sd/stat 拿提示，但这里是不管页面怎么做都生效的
+                    # 权威门禁（同时挡住竞态和直接打 API 的调用方）。
+                    overwrite = sd_truthy(q.get("overwrite", [""])[0])
+                    if not overwrite:
+                        okq, info, pcode, pmsg, pstatus = sd_stat_remote(did, norm)
+                        if not okq and pcode != "SD_NOT_SUPPORTED":
+                            # 板端明确报错（未插卡/忙/不可达），照实透传
+                            return self._send_json(
+                                {"ok": False, "device_id": did, "code": pcode,
+                                 "error": {"code": pcode, "message": pmsg}}, pstatus)
+                        if not okq:
+                            # 只是"问不出来"（板端有 info 但没 stat）≠ 不存在：
+                            # 宁可多问用户一句，也不静默覆盖别人的文件
+                            return self._send_json(
+                                {"ok": False, "device_id": did, "code": "SD_EXISTS",
+                                 "certain": False, "existing": None,
+                                 "error": {"code": "SD_EXISTS",
+                                           "message": f"无法确认目标是否已存在（{pmsg}）。"
+                                                      "继续将覆盖同名文件，确认请带 overwrite=1 重试。"}},
+                                409)
+                        if info["exists"]:
+                            kind = "目录" if info["type"] == "dir" else "文件"
+                            return self._send_json(
+                                {"ok": False, "device_id": did, "code": "SD_EXISTS",
+                                 "certain": True, "existing": info,
+                                 "error": {"code": "SD_EXISTS",
+                                           "message": f"目标已存在同名{kind}"
+                                                      f"（{sd_human_size(info['size'])}）。"
+                                                      "确认覆盖请带 overwrite=1 重试。"}},
+                                409)
+                    return self._sd_stream_upload(did, norm, length, overwrite)
+
+                if sub in ("delete", "mkdir"):
+                    okp, norm, code, msg = sd_parse_path(q.get("path", [""])[0])
+                    if not okp:
+                        return _sd_bad(code, msg)
+                    if norm == "/":
+                        return _sd_bad("SD_INVALID_PATH", "不能对根目录做该操作")
+                    guard = sd_write_guard(did)
+                    if guard:
+                        return _sd_bad("SD_BUSY", guard, 409)
+                    status, payload = sd_http_json(
+                        did, "POST", f"/api/sd/{sub}?path=" + _up.quote(norm, safe=""))
+                    obj, http_code = sd_reply(did, status, payload)
+                    if obj.get("ok"):
+                        obj["path"] = norm
+                    return self._send_json(obj, http_code)
+
+                if sub == "rename":
+                    okf, src, code, msg = sd_parse_path(q.get("from", [""])[0])
+                    if not okf:
+                        return _sd_bad(code, "from " + msg)
+                    okt, dst, code2, msg2 = sd_parse_path(q.get("to", [""])[0])
+                    if not okt:
+                        return _sd_bad(code2, "to " + msg2)
+                    if src == "/" or dst == "/":
+                        return _sd_bad("SD_INVALID_PATH", "不能对根目录改名")
+                    if src == dst:
+                        return _sd_bad("SD_INVALID_PATH", "源与目标相同，无需改名")
+                    guard = sd_write_guard(did)
+                    if guard:
+                        return _sd_bad("SD_BUSY", guard, 409)
+                    status, payload = sd_http_json(
+                        did, "POST",
+                        "/api/sd/rename?from=" + _up.quote(src, safe="")
+                        + "&to=" + _up.quote(dst, safe=""))
+                    obj, http_code = sd_reply(did, status, payload)
+                    if obj.get("ok"):
+                        obj["from"] = src
+                        obj["to"] = dst
+                    return self._send_json(obj, http_code)
+
+                return self._send_json({"ok": False, "error": "not found", "path": path}, 404)
             # /api/v1/brain/say —— 对话入口：不用板端说话也能验证整条链路
             if (len(parts) == 4 and parts[0] == "api" and parts[1] == "v1"
                     and parts[2] == "brain" and parts[3] == "say"):
@@ -3272,11 +4543,9 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         repeat = 1
                     if repeat < 0:
                         repeat = 0
-                    if repeat == 1:
-                        r = servo_dispatch(did, "sequence.run", {"steps": steps})
-                        r["device_id"] = did
-                        return self._send_json(r, 200 if r.get("ok") else 409)
-                    # 重复播放交给服务端后台线程：页面关掉也能一直跑
+                    # 播放统一交给 TWIN_SEQ 逐步下发 servo.move，单次播放就是"只跑一轮"。
+                    # 以前 repeat==1 直接发板端 sequence.run，但整组 JSON 有 2033 字节、
+                    # 超过板端 WS 接收缓冲 1024 字节会被截断丢弃（见 twin.SequenceLooper）。
                     ok, reason, hint = twin_can_take_over(did, "twin.sequence")
                     if not ok:
                         return self._send_json({"ok": False, "error": reason,
@@ -3287,14 +4556,17 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         gap = 50
                     r = TWIN_SEQ.start(did, steps, total_rounds=repeat, gap_ms=gap)
                     r["device_id"] = did
-                    r["est_round_ms"] = twin_mod.sequence_duration_ms(steps)
+                    # 页面按它排画布轮次（还会 +gap_ms）。时间轴上只有 delay_after：
+                    # 舵机走完自己那段 time 不决定下一步什么时候开始
+                    r["est_round_ms"] = twin_mod.sequence_timeline_ms(steps)
                     return self._send_json(r, 200 if r.get("ok") else 409)
 
                 if path == "/api/v1/twin/sequence/stop":
-                    TWIN_SEQ.stop()
-                    r = servo_dispatch(did, "sequence.stop", {})
+                    # 逐步下发模式下板端没有"序列任务"在跑，不用再发 sequence.stop；
+                    # TWIN_SEQ.stop() 自己会把占用登记（含集群其余目标）摘干净。
+                    r = TWIN_SEQ.stop()
                     r["device_id"] = did
-                    return self._send_json(r, 200 if r.get("ok") else 409)
+                    return self._send_json(r, 200)
 
                 if path == "/api/v1/twin/gait/start":
                     ok, reason, hint = twin_can_take_over(did, "twin.gait")
@@ -3519,8 +4791,9 @@ async def main():
     load_firmware_index()
     load_device_tokens()
     load_device_endpoints()
+    load_cluster_mode()
     _load_tts()          # 接得上 edge-tts 就用真语音，接不上自动回退提示音
-    _load_brain()        # 大脑层：DOG_BRAIN=1 且配好 LLM_API_KEY 才真正可用
+    _load_brain()        # 大脑层：llm_config.json 配好 Key 即自动启用（DOG_BRAIN=0 强制关）
     if CTRL_ENABLED:
         threading.Thread(target=start_ctrl_server, daemon=True).start()
         threading.Thread(target=_ctrl_timeout_scanner, daemon=True).start()

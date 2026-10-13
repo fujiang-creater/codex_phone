@@ -323,7 +323,7 @@ def angles_to_servos(store, angles, move_ms=None):
 
 
 def sequence_duration_ms(steps):
-    """估算一条 sequence.run 要跑多久（板端没有动作完成事件，只能算）。
+    """估算一组动作要让设备忙多久（设备占用/看门狗的保守估计）。
 
     每一步的耗时 = max(该步里最慢的舵机 time, delay_after)。
     """
@@ -332,6 +332,20 @@ def sequence_duration_ms(steps):
         servos = (st or {}).get("servos") or []
         slowest = max([_int(s.get("time"), 0, 0, 65535) for s in servos] or [0])
         total += max(slowest, _int((st or {}).get("delay_after"), 0, 0, STEP_MAX_DELAY_MS))
+    return total
+
+
+def sequence_timeline_ms(steps):
+    """一组动作真正的时间轴长度 = 各步 delay_after 之和。
+
+    和 sequence_duration_ms 的区别：那个回答"设备会被占多久"（取
+    max(舵机 time, delay_after)，偏保守）；这个回答"这一步什么时候切下一步"。
+    板端下发一步后只等 delay_after、不等舵机走完，所以时间轴上只有 delay_after。
+    循环播放每轮的实际间隔 = 本函数 + gap_ms，页面画布按它排轮次。
+    """
+    total = 0
+    for st in steps or []:
+        total += _int((st or {}).get("delay_after"), 0, 0, STEP_MAX_DELAY_MS)
     return total
 
 
@@ -502,17 +516,33 @@ class GaitRunner(object):
                     pass
 
 
-# ---------------------------------------------------------------- 动作组循环
+# ---------------------------------------------------------------- 动作组播放
 class SequenceLooper(object):
-    """动作组重复播放：服务端按估算时长续播，页面关掉也能一直跑。
+    """动作组播放：拆成"逐步 servo.move"，由服务端按 delay_after 排时间轴。
 
-    板端 sequence.run 在播放中会回 409 INVALID_STATE，所以续播要等一轮跑完。
-    板端目前没有"动作完成事件"，只能按 sequence_duration_ms 估时长 + 余量。
-    等板端补上完成事件后，这里可以改成事件驱动（见板端待补清单）。
+    为什么不用板端自带的 sequence.run（它本身是好的、板端也实现了）：
+      板端 esp_websocket_client 的接收缓冲是 1024 字节（WEBSOCKET_BUFFER_SIZE_BYTE
+      是硬编码默认值，板端 config 没覆盖），而一组典型动作（4 步 × 12 舵机）
+      序列化成 JSON 有 2033 字节。板端 audio_ws.c 的收包判据是
+
+        op_code == TEXT && payload_offset == 0 && fin
+
+      分片时第一片恰好满足这个条件（fin 取的是整帧的 fin），于是板子拿"前 1024
+      字节"去 cJSON 解析 -> 打印 "invalid JSON from server"，剩下的片因
+      payload_offset != 0 被丢弃：整条指令从未执行。拆成单步 servo.move 后每条约
+      590 字节，稳在缓冲之内。
+
+    语义与板端原生序列逐字一致：sequence_task 每步调的就是
+      send_servo_moves_grouped(step->servos, ...) -> servo_board_move()
+    而 servo.move 走的正是这条路径（command_dispatcher.c 的 servo.move 分支），
+    连发给舵机板的 UART 帧都一样 —— 只是时间轴从板子搬到了这里。
+
+    dispatch(device_id, servos) 由 servev1 注入：直接走 WS，不经过 dev_gate ——
+    整组自己就是这台设备的占用者（DEV_CURRENT 标着 twin.sequence）。
     """
 
     def __init__(self, dispatch, on_start=None, on_stop=None):
-        self._dispatch = dispatch          # dispatch(device_id, steps) -> res
+        self._dispatch = dispatch          # dispatch(device_id, servos) -> res
         self._on_start = on_start
         self._on_stop = on_stop
         self._lock = threading.RLock()
@@ -521,6 +551,10 @@ class SequenceLooper(object):
         self.device_id = None
         self.rounds = 0
         self.total_rounds = 1
+        self.step_index = -1
+        self.steps_total = 0
+        self.sent = 0
+        self.errors = 0
         self.last_error = None
         self.finished_at = None
         self._external_stop = False
@@ -537,28 +571,53 @@ class SequenceLooper(object):
             return {"running": bool(self._thread and self._thread.is_alive()),
                     "device_id": self.device_id, "rounds": self.rounds,
                     "total_rounds": self.total_rounds,
+                    "step": self.step_index + 1, "steps": self.steps_total,
+                    "sent": self.sent, "errors": self.errors,
                     "last_error": self.last_error}
 
     def start(self, device_id, steps, total_rounds=1, gap_ms=50):
+        steps = [st for st in (steps or []) if (st or {}).get("servos")]
+        if not steps:
+            return {"ok": False, "error": "动作组里没有可下发的步（每步都得有 servos）"}
+        limit = int(total_rounds)
+        gap = max(0, int(gap_ms or 0))
         with self._lock:
             if self._thread and self._thread.is_alive():
-                return {"ok": False, "error": "动作组循环已在运行"}
+                return {"ok": False, "error": "动作组播放已在运行"}
             self.device_id = device_id
             self.rounds = 0
-            self.total_rounds = int(total_rounds)
+            self.total_rounds = limit
+            self.step_index = -1
+            self.steps_total = len(steps)
+            self.sent = self.errors = 0
             self.last_error = None
             self.finished_at = None
             self._stop = threading.Event()
             self._external_stop = False
-            self._thread = threading.Thread(target=self._loop,
-                                            args=(device_id, steps, total_rounds, gap_ms),
-                                            name="twin-seq", daemon=True)
-            self._thread.start()
+        # 第一步同步发：拿到真实的 ok/error 再回 HTTP。
+        # 不然设备离线时接口会回 200、页面以为在跑，画布自顾自地动起来 —— 那是最坏的结果。
+        res = self._dispatch(device_id, steps[0].get("servos") or []) or {}
+        if not res.get("ok"):
+            with self._lock:
+                self.errors = 1
+                self.last_error = res.get("error") or "下发失败"
+            return {"ok": False, "error": res.get("error") or "第一步下发失败",
+                    "hint": res.get("hint")}
+        with self._lock:
+            self.sent = 1
+            self.step_index = 0
         if self._on_start:
             try:
                 self._on_start(device_id)
             except Exception as e:  # noqa: BLE001
                 print(f"[twin] 动作组 on_start 回调失败：{e}", flush=True)
+        with self._lock:
+            self._thread = threading.Thread(
+                target=self._loop,
+                args=(device_id, steps, limit, gap,
+                      _int(steps[0].get("delay_after"), 0, 0, STEP_MAX_DELAY_MS)),
+                name="twin-seq", daemon=True)
+            self._thread.start()
         return {"ok": True, "state": self.state()}
 
     def stop(self, wait=True, timeout=3.0):
@@ -576,24 +635,44 @@ class SequenceLooper(object):
                 print(f"[twin] 动作组 on_stop 回调失败：{e}", flush=True)
         return {"ok": True, "was_running": was, "state": self.state()}
 
-    def _loop(self, dev, steps, total_rounds, gap_ms):
-        per_round = sequence_duration_ms(steps) + max(0, int(gap_ms))
-        while not self._stop.is_set() and (total_rounds <= 0 or self.rounds < total_rounds):
-            res = self._dispatch(dev, steps) or {}
-            if res.get("ok"):
-                self.rounds += 1
-            else:
-                # sequence.run 是排他命令：板子还在跑上一轮时会回 409，退一步重试
-                err = str(res.get("error") or "")
-                if "INVALID_STATE" in err and self.rounds < max(1, total_rounds):
-                    self._stop.wait(0.4)
-                    continue
+    def _loop(self, dev, steps, total_rounds, gap_ms, first_delay_ms):
+        """按板端节奏走时间轴：发一步 -> 等这一步的 delay_after -> 发下一步。
+
+        第 1 轮第 1 步已经在 start() 里同步发过了，所以这里先补上它的 delay_after。
+        轮与轮之间再等 gap_ms —— 板端原生序列也是"发完最后一步就退任务"，下一轮的
+        第一步从当时实际位置接着插值，和这里完全一致。
+        """
+        wait_ms = first_delay_ms
+        while not self._stop.is_set():
+            self.rounds += 1
+            start_i = 1 if self.rounds == 1 else 0
+            if wait_ms:
+                self._stop.wait(wait_ms / 1000.0)
+                wait_ms = 0
+            failed = False
+            for i in range(start_i, len(steps)):
+                if self._stop.is_set():
+                    failed = True
+                    break
+                res = self._dispatch(dev, steps[i].get("servos") or []) or {}
                 with self._lock:
-                    self.last_error = res.get("error") or "下发失败"
+                    self.sent += 1
+                    self.step_index = i
+                if not res.get("ok"):
+                    with self._lock:
+                        self.errors += 1
+                        self.last_error = res.get("error") or "下发失败"
+                    failed = True
+                    break
+                d = _int(steps[i].get("delay_after"), 0, 0, STEP_MAX_DELAY_MS)
+                if d:
+                    self._stop.wait(d / 1000.0)
+            if failed:
                 break
             if total_rounds > 0 and self.rounds >= total_rounds:
                 break
-            self._stop.wait(max(0.05, per_round / 1000.0))
+            if gap_ms:
+                self._stop.wait(gap_ms / 1000.0)
         with self._lock:
             self.finished_at = time.time()
             notify = not self._external_stop

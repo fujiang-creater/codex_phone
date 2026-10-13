@@ -70,10 +70,35 @@
     align-items: center; margin: 4px 0; font-size: 11px; }
   .cal-row input, .cal-row select { height: 26px; font-size: 12px; padding: 0 5px; }
   .servo-row { display: grid; grid-template-columns: 52px 1fr 1fr; gap: 8px; align-items: end;
-    margin: 6px 0; }
+    margin: 6px 0; border-left: 3px solid transparent; padding-left: 6px; }
   .servo-row input { height: 28px; }
-  .step { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 8px 0; }
+  .servo-row.on { border-left-color: var(--accent); background: #f7faff; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 8px 0;
+    cursor: pointer; }
+  .step:hover { border-color: #b9c6da; }
+  .step.editing { border-color: var(--accent); border-left: 3px solid var(--accent);
+    padding-left: 6px; background: #f7faff; }
+  .step summary { font-size: 11px; color: var(--muted); cursor: pointer; margin-top: 6px; }
+  .step .posline { color: var(--muted); word-break: break-all; margin-top: 6px; }
+  .step.editing .posline { color: var(--ink); }
   .motion-list { max-height: 300px; overflow: auto; }
+  .edit-ctx { display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+    border: 1px solid var(--accent); border-radius: 8px; padding: 7px 9px; margin: 0 0 10px;
+    background: #f7faff; font-size: 12px; }
+  .edit-ctx.on { display: flex; }
+  .edit-ctx .nm { color: var(--accent); font-weight: 600; }
+  /* 本地回放：正在播的那一步 */
+  .step.pb { border-color: var(--warn); border-left: 3px solid var(--warn);
+    padding-left: 6px; background: #fffaf0; }
+  .step .pb-bar { display: none; height: 3px; background: #f0e2c8; border-radius: 2px;
+    margin-top: 7px; overflow: hidden; }
+  .step.pb .pb-bar { display: block; }
+  .step .pb-bar i { display: block; height: 100%; width: 0; background: var(--warn); }
+  .pb-line { display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+    border: 1px solid var(--warn); border-radius: 8px; padding: 7px 9px; margin: 8px 0 0;
+    background: #fdf9f1; font-size: 12px; }
+  .pb-line.on { display: flex; }
+  .pb-line .nm { color: var(--warn); font-weight: 600; }
   .note { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 6px 0 0; }
   .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; font-size: 12px; }
   .kv span:nth-child(odd) { color: var(--muted); }
@@ -87,6 +112,57 @@
   .portsel .pin { width: 74px; height: 26px; font-size: 12px; }
   .portsel .pgo { height: 26px; padding: 0 9px; font-size: 12px; }
   .pinfo { font-size: 12px; color: var(--muted); }
+  /* ---- 请求流水 ---- */
+  #ledger { max-height: 300px; overflow: auto; font-family: ui-monospace, Consolas, monospace; }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .filters button { height: 24px; padding: 0 9px; font-size: 12px;
+    background: #fff; color: var(--ink); border-color: var(--line); }
+  .filters button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .lg { border-bottom: 1px solid var(--line); padding: 6px 2px; cursor: pointer; }
+  .lg:hover { background: #f7f9fc; }
+  .lg .hd { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .lg .tm { color: var(--muted); font-size: 11px; }
+  .lg .pt { font-size: 12px; flex: 1; min-width: 120px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lg .ms { color: var(--muted); font-size: 11px; }
+  .lg .bd { margin-top: 6px; font-size: 11.5px; white-space: pre-wrap;
+    word-break: break-all; color: var(--muted); background: #f7f9fc;
+    border-radius: 5px; padding: 6px; }
+  .lg .hint { margin-top: 5px; font-size: 11.5px; color: var(--bad); }
+  .lg.note { cursor: default; color: var(--muted); font-size: 12px; }
+  .bdg { display: inline-block; min-width: 36px; text-align: center;
+    padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  .bdg.ok { background: #e7f6ec; color: var(--ok); }
+  .bdg.warn { background: #fdf3e3; color: var(--warn); }
+  .bdg.bad { background: #fdecec; color: var(--bad); }
+  /* ---- 关节步进 ---- */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px;
+    margin: -3px 0 8px 84px; }
+  .steps button { height: 23px; padding: 0; font-size: 12px;
+    background: #fff; color: var(--ink); border-color: var(--line); }
+  .steps button:active { background: var(--accent); color: #fff; }
+  /* ---- 读回对照表 ---- */
+  .vfy { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  .vfy th, .vfy td { border-bottom: 1px solid var(--line); padding: 3px 6px; text-align: right; }
+  .vfy th:first-child, .vfy td:first-child { text-align: left; }
+  .vfy th { color: var(--muted); font-weight: 400; }
+  .vfy td.over { color: var(--bad); font-weight: 500; }
+  .vfy td.miss { color: var(--warn); }
+  .vfy-sum { font-size: 12px; margin-top: 6px; }
+  /* ---- 板端日志 ---- */
+  #tlog { height: 230px; overflow: auto; background: #0f172a; border-radius: 6px;
+    padding: 8px; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+  #tlog .ln { white-space: pre-wrap; word-break: break-all; color: #cbd5e1; }
+  #tlog .ln.lv-E { color: #fca5a5; }
+  #tlog .ln.lv-W { color: #fcd34d; }
+  #tlog .ln.lv-I { color: #8fa3b8; }
+  #tlog .ln.sys { color: #64748b; font-style: italic; }
+  #tlog .ln mark { background: #fde68a; color: #0f172a; border-radius: 2px; }
+  .tlog-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .tlog-bar .stat { font-size: 11px; color: var(--muted); }
+  /* ---- 离线降级提示 ---- */
+  .stale-tag { margin-top: 8px; font-size: 12px; background: #fdf3e3; color: var(--warn);
+    border: 1px solid #fcd34d; border-radius: 6px; padding: 6px 8px; }
 </style>
 </head>
 <body>
@@ -100,7 +176,7 @@
     <div style="width:220px;"><label style="margin:0 0 4px;">目标设备</label>
       <select id="device"></select></div>
     <div style="width:220px;"><label style="margin:0 0 4px;">访问 token（Bearer）</label>
-      <input id="token" type="password" placeholder="设备 token" /></div>
+      <input id="token" type="password" value="dev-token-change-me" placeholder="设备 token" /></div>
     <div style="width:190px;"><label style="margin:0 0 4px;">控制端口</label>
       <div class="portsel">
         <button class="pbtn" data-port="8000">8000</button>
@@ -121,6 +197,7 @@
   <div>
     <div class="card" style="padding:10px;">
       <canvas id="view"></canvas>
+      <div id="staleTag" class="stale-tag" style="display:none;"></div>
       <div class="note">拖动画布中的脚端红点可反解（需勾选「拖脚 IK」）。孪生只做可视化与运动学，
         真狗的动作全部经服务端 WS 命令层下发。</div>
     </div>
@@ -129,11 +206,13 @@
       <h2>实时下发预览</h2>
       <div class="bar">
         <button id="deployBtn">下发当前姿态</button>
+        <button class="go" id="deployVerifyBtn">下发并读回校验</button>
         <button class="lite" id="readPoseBtn">读取真实位置为当前值</button>
         <button class="lite" id="calCapBtn">记录当前为中位</button>
         <button class="danger" id="unloadBtn">卸力全部 ID</button>
       </div>
       <div class="out mono" id="payload" style="margin-top:10px;"></div>
+      <div id="verifyOut"></div>
     </div>
 
     <div class="card">
@@ -167,6 +246,9 @@
         <button class="lite" id="setAllTime">统一时间</button>
         <button id="sendAll">一键下发全部</button>
       </div>
+      <div class="note">这张表同时是动作组的编辑面：点某一步的「微调」会把该步的 pos / time
+        填进来，改完点那一步的「更新」覆盖回去。<b>更新只写本步原有的舵机</b>，
+        表格里多出来的行不会写入（要把它们存成新动作，用「另存为新步」）。</div>
       <div id="allRows" style="margin-top:10px;"></div>
     </div>
 
@@ -186,13 +268,24 @@
         <input id="motionCount" type="number" min="1" max="9999" value="1" style="width:84px;" />
         <label style="display:flex;gap:6px;align-items:center;margin:0;width:auto;">
           <input id="motionRepeat" type="checkbox" style="width:auto;height:auto;" />循环</label>
-        <button class="go" id="playGroup">播放本组</button>
+        <button class="go" id="playGroup">播放本组（下发）</button>
+        <button class="lite" id="previewGroup" title="只在本页画布上按同样的时序走一遍，不发任何指令给板子">本地预演</button>
         <button class="danger" id="stopGroup">停止</button>
         <button class="lite" id="dropStep">删除最后一步</button>
       </div>
-      <div class="note">播放走 <span class="mono">sequence.run</span>。勾选「循环」时由服务端线程续播，
-        页面关掉也会继续（板端暂无动作完成事件，按估算时长续播）。</div>
+      <div class="note">播放由服务端按每步的「间隔 ms」<b>逐步下发</b>
+        <span class="mono">servo.move</span>，与板端原生序列逐步执行的行为一致
+        （整组 JSON 有 2033 字节，超过板端 1024 字节的 WS 接收缓冲会被整条丢弃）。
+        勾选「循环」时由服务端线程续播，页面关掉也会继续。
+        <b>点任意一步的「微调」，该步的舵机位置就填回下面的手动表格</b>，改完点那一步的
+        <b>「更新」</b>把这一步覆盖掉；每步的「间隔 ms」也能直接改。
+        点「<b>播放本组（下发）</b>」下发给真狗，画布跟着动：按板端语义回放 —— 每步等
+        <span class="mono">delay_after</span> 到点就切下一步（不等舵机走完），
+        各舵机按自己的 <span class="mono">time</span> 从当前位置插值过去。
+        点「<b>本地预演</b>」只在本页走同样的时序，一个字节都不发给板子
+        （组没调好、或者狗不在线时先用它看动作）。</div>
       <div id="motionInfo" class="note"></div>
+      <div id="pbInfo" class="pb-line"></div>
       <div id="motionList" class="motion-list"></div>
     </div>
 
@@ -236,6 +329,12 @@
 
     <div class="card">
       <h2>FK / IK 姿态</h2>
+      <div class="edit-ctx" id="editCtx">
+        <span class="nm" id="editName">—</span>
+        <button class="lite" id="editUpdate" style="height:26px;font-size:12px;">更新此步</button>
+        <button class="lite" id="editSaveAs" style="height:26px;font-size:12px;">另存为新步</button>
+        <button class="lite" id="editCancel" style="height:26px;font-size:12px;">退出编辑</button>
+      </div>
       <div class="bar leg-buttons">
         <button data-leg="0" class="active">FL</button>
         <button data-leg="1">FR</button>
@@ -243,8 +342,14 @@
         <button data-leg="3">BR</button>
       </div>
       <div class="row"><b>外展 a0</b><input type="range" id="a0" min="-60" max="60" value="0"><span id="a0v">0</span></div>
+      <div class="steps" data-dof="a0"><button data-d="-5" type="button">-5</button><button data-d="-1" type="button">-1</button><button data-d="1" type="button">+1</button><button data-d="5" type="button">+5</button></div>
       <div class="row"><b>大腿 a1</b><input type="range" id="a1" min="-120" max="120" value="15"><span id="a1v">15</span></div>
+      <div class="steps" data-dof="a1"><button data-d="-5" type="button">-5</button><button data-d="-1" type="button">-1</button><button data-d="1" type="button">+1</button><button data-d="5" type="button">+5</button></div>
       <div class="row"><b>小腿 a2</b><input type="range" id="a2" min="-150" max="150" value="35"><span id="a2v">35</span></div>
+      <div class="steps" data-dof="a2"><button data-d="-5" type="button">-5</button><button data-d="-1" type="button">-1</button><button data-d="1" type="button">+1</button><button data-d="5" type="button">+5</button></div>
+      <div class="note">键盘微调（焦点不在输入框内时）：<span class="mono">←→</span> 外展、
+        <span class="mono">↑↓</span> 大腿、<span class="mono">, .</span> 小腿，
+        按住 <span class="mono">Shift</span> 步长 ×5。</div>
       <div class="bar">
         <button class="lite" id="applyAll">套用四腿</button>
         <button class="lite" id="resetPose">重置</button>
@@ -269,19 +374,149 @@
     </div>
 
     <div class="card">
-      <h2>事件日志</h2>
-      <div id="log"></div>
+      <h2>请求流水</h2>
+      <div class="filters" id="lgFilter">
+        <button data-f="all" class="on">全部</button>
+        <button data-f="fail">仅失败</button>
+        <button data-f="write">下发</button>
+        <button data-f="read">读取</button>
+        <button id="lgClear">清空</button>
+        <button id="lgCopy">复制</button>
+      </div>
+      <div id="ledger"></div>
+    </div>
+
+    <div class="card">
+      <h2>板端日志</h2>
+      <div class="bar">
+        <button id="tlogPause">暂停</button>
+        <button id="tlogClear">清屏</button>
+        <button id="tlogCopy">复制</button>
+        <span class="note" style="margin:0 0 0 auto;" id="tlogDev">—</span>
+      </div>
+      <div id="tlog" style="margin-top:8px;"></div>
+      <div class="tlog-bar"><span class="stat" id="tlogStat">—</span></div>
     </div>
   </aside>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const log = (m) => {
-  const el = $("log");
-  el.textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`;
-  el.scrollTop = el.scrollHeight;
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ---------------- 错误可读化 ---------------- */
+const ERR_HINT = {
+  SERVICE_ERROR:    "板端执行失败：外设无响应（读电池/位置时通常是舵机板未回包）",
+  INVALID_ARGUMENT: "参数不合法：检查 ids / servos 是否完整、数值是否越界",
+  INVALID_STATE:    "板端状态不允许：可能正在播放动作组或 OTA",
+  NOT_FOUND:        "目标不存在：设备 ID 或固件版本可能不对",
+  TIMEOUT:          "超时：板端未在期限内回执（去板端日志确认有没有收到）",
+  BUSY:             "设备忙：同一设备同时只允许一条命令，等它跑完",
+  UNAVAILABLE:      "服务不可用：设备没连上音频 WS",
+  DEVICE_OFFLINE:   "设备离线：板子没有连上服务端",
+  OTA_IN_PROGRESS:  "OTA 进行中：此时不接受其它命令",
+  UNAUTHORIZED:     "未授权：token 不对或为空",
+  CLUSTER:          "集群广播：目标包含多台设备，看返回里的失败名单",
 };
+const CODE_RE = /([A-Z][A-Z0-9_]{3,})/;
+function explain(res) {
+  const d = (res && res.data) || {};
+  let code = d.error_code || "";
+  if (!code && typeof d.error === "string") {
+    const m = CODE_RE.exec(d.error);
+    if (m) code = m[1];
+  }
+  if (code) return ERR_HINT[code] ? code + " · " + ERR_HINT[code] : code;
+  if (res && res.status === 0) return "网络错误：请求没发出去（服务端是否在跑？）";
+  if (res && !res.ok) return "HTTP " + res.status + (d.error ? " · " + d.error : "");
+  return "";
+}
+
+/* ---------------- 请求流水 ---------------- */
+const LG_MAX = 300;
+let LEDGER = [], lgFilter = "all", lgSeq = 0;
+const lgOpen = new Set();
+function hhmmss(t) {
+  const d = new Date(t), p = (n, w) => String(n).padStart(w || 2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds())
+    + "." + p(d.getMilliseconds(), 3);
+}
+function lgClass(r) {
+  if (r.kind === "note") return "note";
+  if (r.status === 0 || r.status >= 500) return "bad";
+  if (r.status >= 400) return "warn";
+  return "ok";
+}
+function lgText(r) {
+  if (r.kind === "note") return r.text || "";
+  return r.method + " " + r.path + (r.note ? "  · " + r.note : "");
+}
+function ledgerPush(rec) {
+  rec.ts = rec.ts || Date.now();
+  rec.id = ++lgSeq;
+  LEDGER.unshift(rec);
+  if (LEDGER.length > LG_MAX) LEDGER.length = LG_MAX;
+  renderLedger();
+}
+function lgPass(r) {
+  if (lgFilter === "all") return true;
+  if (r.kind === "note") return false;
+  if (lgFilter === "fail") return r.ok !== true;
+  if (lgFilter === "write") {
+    return /servo\/move|servo\/unload|gait\/start|gait\/stop|sequence|estop|command/.test(String(r.path));
+  }
+  if (lgFilter === "read") {
+    return /battery|servo\/pos|position|status|store/.test(String(r.path));
+  }
+  return true;
+}
+function renderLedger() {
+  const box = $("ledger");
+  if (!box) return;
+  const rows = LEDGER.filter(lgPass);
+  if (!rows.length) { box.innerHTML = '<div class="note">暂无记录</div>'; return; }
+  box.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (const r of rows) {
+    const d = document.createElement("div");
+    d.className = "lg " + (r.kind === "note" ? "note" : "");
+    if (r.kind === "note") {
+      d.innerHTML = '<span class="tm">' + hhmmss(r.ts) + "</span> " + esc(lgText(r));
+      frag.appendChild(d);
+      continue;
+    }
+    const cls = lgClass(r), open = lgOpen.has(r.id);
+    d.innerHTML =
+      '<div class="hd"><span class="tm">' + hhmmss(r.ts) + "</span>" +
+      '<span class="bdg ' + cls + '">' + (r.status === 0 ? "ERR" : r.status) + "</span>" +
+      '<span class="pt">' + esc(lgText(r)) + "</span>" +
+      '<span class="ms">' + r.ms + "ms</span></div>" +
+      (r.hint ? '<div class="hint">' + esc(r.hint) + "</div>" : "") +
+      (open ? '<div class="bd">' + esc(r.detail || "") + "</div>" : "");
+    d.onclick = () => {
+      if (lgOpen.has(r.id)) lgOpen.delete(r.id); else lgOpen.add(r.id);
+      renderLedger();
+    };
+    frag.appendChild(d);
+  }
+  box.appendChild(frag);
+}
+function ledCopy() {
+  const rows = LEDGER.filter(lgPass);
+  const txt = rows.map((r) => r.kind === "note"
+    ? "[" + hhmmss(r.ts) + "] " + lgText(r)
+    : "[" + hhmmss(r.ts) + "] " + (r.status === 0 ? "ERR" : r.status) + " "
+      + lgText(r) + " " + r.ms + "ms" + (r.hint ? "  <- " + r.hint : "")
+      + (r.detail ? "\n    " + r.detail.replace(/\n/g, "\n    ") : "")
+  ).join("\n");
+  const done = () => show("流水已复制 " + rows.length + " 条");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(done, () => show("复制失败，请手动选中"));
+  } else { show("浏览器不支持剪贴板，请手动选中"); }
+}
+function log(m) { ledgerPush({ kind: "note", text: String(m) }); }
+
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const clampInt = (v, a, b) => { const n = parseInt(v, 10); return Number.isFinite(n) ? clamp(n, a, b) : a; };
 const DEG = Math.PI / 180;
@@ -295,17 +530,39 @@ const base = () => ($("base").value || "").replace(/\/+$/, "") ||
 const headers = () => ({ "Content-Type": "application/json",
   "Authorization": "Bearer " + $("token").value.trim() });
 
-async function api(method, path, body) {
+async function api(method, path, body, opts) {
+  const t0 = performance.now();
+  let out;
   try {
     const res = await fetch(base() + path, { method, headers: headers(),
       body: body ? JSON.stringify(body) : undefined });
     let data = null;
     try { data = await res.json(); } catch (e) { data = null; }
-    return { ok: res.ok, status: res.status, data: data || {} };
-  } catch (e) { return { ok: false, status: 0, data: { error: String(e) } }; }
+    out = { ok: res.ok, status: res.status, data: data || {} };
+  } catch (e) { out = { ok: false, status: 0, data: { error: String(e) } }; }
+  const quietOk = !!(opts && (opts.silent || (opts.quiet && out.ok)));
+  if (!quietOk) recordCall(method, path, body, out,
+                           Math.round(performance.now() - t0));
+  return out;
 }
-const GET = (p) => api("GET", p);
-const POST = (p, b) => api("POST", p, b || {});
+function callNote(body) {
+  if (body && Array.isArray(body.servos)) return body.servos.length + " 个舵机";
+  if (body && Array.isArray(body.ids)) return body.ids.length + " 个 ID";
+  if (body && Array.isArray(body.steps)) return body.steps.length + " 步";
+  return "";
+}
+function recordCall(method, path, body, out, ms) {
+  ledgerPush({
+    method, path, status: out.status, ok: out.ok, ms, note: callNote(body),
+    hint: out.ok ? "" : explain(out),
+    detail: [
+      body ? "请求 " + JSON.stringify(body) : "",
+      "响应 " + JSON.stringify(out.data, null, 2),
+    ].filter(Boolean).join("\n"),
+  });
+}
+const GET = (p, o) => api("GET", p, undefined, o);
+const POST = (p, b, o) => api("POST", p, b || {}, o);
 
 function show(x) {
   $("status").textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2);
@@ -320,6 +577,10 @@ let CAL = DEF_CAL();
 let IDS = [1,2,3,4,5,6,7,8,9,10,11,12];
 let MOTIONS = [];
 let MG_COUNT = 10, MG_MAX_STEPS = 20;
+let EDIT = null;   /* 正在微调的动作步：{gi, si, ref}；ref 是步对象的引用，用来发现结构变化 */
+/* FK/IK 与键盘微调改动姿态后，需要把这些角度同步回手动表格 —— 否则「更新」读表格会读不到。
+   SYNC_GUARD：载入动作步时先把表格填好，这个窗口期内不要反向覆盖表格（避免量化误差改写原值）。 */
+let SYNC_GUARD = false;
 const G = {running:false, t:0, period:0.7, stride:70, lift:35, bodyHeight:95,
            moveMs:500, deployMs:120, last:0, timer:0, busy:false};
 let selectedLeg = 0, dragLeg = -1, serverGait = null, localGait = false;
@@ -337,7 +598,7 @@ function queueSave(key, value) {
 async function flushSave() {
   if (!Object.keys(pending).length) return;
   const patch = pending; pending = {};
-  const r = await POST("/api/v1/twin/store", { patch });
+  const r = await POST("/api/v1/twin/store", { patch }, { quiet: true });
   if (!r.ok) { log("保存失败：" + JSON.stringify(r.data)); show(r.data); return; }
   applyStoreMeta(r.data.store);
 }
@@ -486,7 +747,7 @@ function draw() {
 function syncLegUI(i) {
   ["a0","a1","a2"].forEach(k => { $(k).value = A[i][k]; $(k+"v").textContent = Number(A[i][k]).toFixed(0); });
 }
-function applyFK() { syncLegUI(selectedLeg); updatePayload(); draw(); }
+function applyFK() { syncLegUI(selectedLeg); updatePayload(); draw(); syncAnglesToTable(); }
 
 /* ---------------- 标定表 ---------------- */
 function renderCal() {
@@ -548,22 +809,196 @@ function renderMotionSelect() {
     (_, i) => `<option value="${i+1}">动作组 ${i+1}</option>`).join("");
   $("motionGroup").value = String(motionIndex() + 1);
 }
+/* 步内容可读化：按 FL/FR/BL/BR 列出三关节舵机位置，缺的显示 -- */
+function stepLine(step) {
+  const byId = new Map((step.servos || []).map(s => [String(s.id), +s.pos]));
+  return LEGS.map((l, li) => l.name + " " + DOF.map((_, d) => {
+    const id = String(IDS[li*3+d]);
+    return byId.has(id) ? String(byId.get(id)) : "--";
+  }).join("/")).join("   ");
+}
 function renderMotionGroup() {
-  const g = currentMotion();
+  /* 结构变了（清空 / 删除 / 改组）就自动退出编辑，避免 EDIT 悬空指向已消失的步 */
+  if (EDIT && !(MOTIONS[EDIT.gi] && MOTIONS[EDIT.gi].steps[EDIT.si] === EDIT.ref)) EDIT = null;
+  renderEditCtx();
+  const gi = motionIndex(), g = currentMotion();
   $("motionName").value = g.name;
   $("motionInfo").textContent = `已保存 ${g.steps.length} / ${MG_MAX_STEPS} 步`;
-  $("motionList").innerHTML = g.steps.length ? g.steps.map((s, i) =>
-    `<div class="step"><div class="bar"><strong style="font-size:12px;">Step ${i+1}</strong>
-      <span class="note" style="margin:0;">delay_after ${s.delay_after} ms</span>
+  $("motionList").innerHTML = g.steps.length ? g.steps.map((s, i) => {
+    const on = !!(EDIT && EDIT.gi === gi && EDIT.ref === s);
+    return `<div class="step${on ? " editing" : ""}" data-step="${i}" title="点一下载入右侧编辑器微调">
+      <div class="bar"><strong style="font-size:12px;">Step ${i+1}</strong>
+      <span class="note" style="margin:0;">间隔</span>
+      <input class="dly" data-dly="${i}" type="number" min="0" max="60000"
+        value="${clampInt(s.delay_after, 0, 60000)}" style="width:80px;height:26px;font-size:12px;">
+      <button class="lite" data-edit="${i}" style="height:26px;font-size:12px;" title="把这一步的 pos/time 填回下面的手动表格">微调</button>
+      <button class="${on ? "go" : "lite"}" data-upd="${i}" style="height:26px;font-size:12px;"${on ? "" : " disabled"}
+        title="${on ? "用表格里当前的 pos/time 覆盖这一步" : "先点「微调」把这一步载入表格"}">更新</button>
       <button class="lite" data-run="${i}" style="height:26px;font-size:12px;">运行一步</button>
       <button class="lite" data-del="${i}" style="height:26px;font-size:12px;">删除</button></div>
-      <div class="mono" style="margin-top:6px;color:var(--muted);word-break:break-all;">${JSON.stringify(s)}</div>
-     </div>`).join("") : `<div class="note">当前动作组为空</div>`;
+      <div class="mono posline">${stepLine(s)}</div>
+      <div class="pb-bar"><i></i></div>
+      <details><summary>原始 JSON</summary>
+        <div class="mono" style="word-break:break-all;">${JSON.stringify(s)}</div></details>
+     </div>`;
+  }).join("") : `<div class="note">当前动作组为空</div>`;
   document.querySelectorAll("#motionList [data-del]").forEach(b => b.onclick = () => {
     currentMotion().steps.splice(+b.dataset.del, 1); renderMotionGroup(); queueSave("motion_groups", MOTIONS);
   });
+  /* 「运行一步」＝在真狗上跑一步（调试用），固定下发 */
   document.querySelectorAll("#motionList [data-run]").forEach(b => b.onclick = () =>
-    playSteps([currentMotion().steps[+b.dataset.run]]));
+    playSteps([currentMotion().steps[+b.dataset.run]], 1, true));
+  document.querySelectorAll("#motionList [data-edit]").forEach(b => b.onclick = () =>
+    loadStep(motionIndex(), +b.dataset.edit));
+  /* 「更新」：把表格当前值覆盖回该步 —— 只有正在微调的那一步可用（其余 disabled，防误覆盖） */
+  document.querySelectorAll("#motionList [data-upd]").forEach((b, i) => b.onclick = () => {
+    if (!EDIT || EDIT.gi !== motionIndex() || EDIT.si !== i) {   /* 双保险：不靠 disabled 兜底 */
+      show("这一步不是当前正在微调的步：先点它的「微调」把值载入表格"); return;
+    }
+    updateStep();
+  });
+  /* 点整张卡片也能载入；点按钮 / 输入框 / 折叠三角不触发 */
+  document.querySelectorAll("#motionList .step").forEach(el => el.onclick = (e) => {
+    if (e.target.closest("button, input, select, textarea, summary, details, a")) return;
+    loadStep(motionIndex(), +el.dataset.step);
+  });
+  /* 每步「间隔」可直接改；只改模型不重渲染，否则会抢走输入焦点 */
+  document.querySelectorAll("#motionList [data-dly]").forEach(el => el.oninput = () => {
+    const st = currentMotion().steps[+el.dataset.dly];
+    if (!st) return;
+    st.delay_after = clampInt(el.value, 0, 60000);
+    queueSave("motion_groups", MOTIONS);
+  });
+  /* 列表被重建了：回放的高亮/进度条要按新 DOM 重画；组换了就别再指着一堆不存在的步 */
+  if (PB.on) {
+    if (PB.gi !== gi) pbEnd("已切换动作组，画布停止回放（真狗仍按原组在跑）");
+    else pbPaint(PB.tLocal >= PB.total);
+  }
+}
+
+/* ---------------- 动作步微调：点一步 -> 填回手动表格 -> 改表 -> 更新覆盖 ---------------- */
+function renderEditCtx() {
+  const box = $("editCtx");
+  if (!EDIT) { box.classList.remove("on"); return; }
+  box.classList.add("on");
+  $("editName").textContent = `正在微调：${MOTIONS[EDIT.gi].name} · Step ${EDIT.si+1}`;
+}
+function servoIndexOf(id) { return IDS.indexOf(+id); }   /* 舵机 id -> 0..11（腿*3+关节） */
+function posToDeg(i, pos) {                              /* boardPos() 的逆 */
+  const c = CAL[i] || DEF_CAL()[i], k = (+c.dir) * (+c.scale), lim = DEG_LIMIT[DOF[i%3]];
+  if (!k) return null;
+  return { deg: (+pos - (+c.neutral)) / k, lim };
+}
+/* 表格「行元素」——不是 readRows() 的纯值快照：那个只有 {id,pos,time}，没有 querySelector，
+   拿它去回写 input 会直接 TypeError。凡是要写表格的值，一律走这几个。 */
+function tableEls() {
+  let els = Array.from(document.querySelectorAll("#allRows .servo-row"));
+  if (!els.length) { renderRows(); els = Array.from(document.querySelectorAll("#allRows .servo-row")); }
+  return els;
+}
+function tableMap() { return new Map(tableEls().map(el => [String(el.dataset.id), el])); }
+function rowPos(el) { return clampInt(el.querySelector(".pos").value, 0, 1000); }
+function rowTime(el) { return clampInt(el.querySelector(".time").value, 0, 65535); }
+function setRow(el, pos, time) {
+  el.querySelector(".pos").value = String(pos);
+  if (time != null) el.querySelector(".time").value = String(time);
+}
+/* FK/IK 滑块或键盘微调改出来的姿态，同步回表格 —— 否则「更新」读表格读不到这些改动 */
+function syncAnglesToTable() {
+  if (!EDIT || SYNC_GUARD) return;
+  const present = new Set((EDIT.ref.servos || []).map(sv => String(sv.id)));
+  const elById = tableMap();
+  if (!elById.size) return;
+  IDS.forEach((id, i) => {
+    if (!present.has(String(id))) return;      /* 本步没有的舵机，不往表格里塞 */
+    const el = elById.get(String(id));
+    if (!el) return;
+    const li = Math.floor(i / 3), d = i % 3;
+    el.querySelector(".pos").value = String(boardPos(li, d, A[li][DOF[d]]));
+  });
+}
+function loadStep(gi, si) {
+  pbEnd("微调接管，画布回放停止");
+  const g = MOTIONS[gi], step = g && g.steps && g.steps[si];
+  if (!step || !Array.isArray(step.servos) || !step.servos.length) { show("这一步没有舵机数据"); return; }
+  const elById = tableMap();
+  if (!elById.size) { show("手动表格是空的：请先在「舵机（手动 / 表格）」里点「刷新行」"); return; }
+  const inStep = new Set(step.servos.map(sv => String(sv.id)));
+  const next = A.map(a => Object.assign({}, a));
+  const missing = [], clipped = [];
+  let hit = 0, firstLeg = -1;
+  /* ① 该步的 pos / time 填回表格 */
+  step.servos.forEach(sv => {
+    const el = elById.get(String(sv.id));
+    if (!el) { missing.push(sv.id); return; }
+    setRow(el, clampInt(sv.pos, 0, 1000), sv.time == null ? null : clampInt(sv.time, 0, 65535));
+    hit++;
+    /* ② 顺带把姿态喂给画布，方便对着看（写回的唯一来源仍是表格） */
+    const i = servoIndexOf(sv.id);
+    if (i < 0) return;
+    const rr = posToDeg(i, sv.pos);
+    if (!rr) return;
+    const li = Math.floor(i / 3), dof = DOF[i%3];
+    const v = clamp(rr.deg, rr.lim[0], rr.lim[1]);
+    if (v !== rr.deg) clipped.push(LEGS[li].name + "-" + DOF_LABEL[i%3]);
+    next[li][dof] = v;
+    if (firstLeg < 0) firstLeg = li;
+  });
+  if (!hit) {
+    show("这一步的舵机在手动表格里没有对应行（表格舵机 ID = " + IDS.join(",") + "）");
+    return;
+  }
+  const kept = Array.from(elById.keys()).filter(id => !inStep.has(id)).length;
+  /* 标出这一步占用了表格里的哪几行 —— 只含部分舵机的步一眼就能看出来 */
+  elById.forEach((el, id) => el.classList.toggle("on", inStep.has(id)));
+  next.forEach((a, li) => Object.assign(A[li], a));
+  if (firstLeg >= 0) {
+    selectedLeg = firstLeg;
+    document.querySelectorAll(".leg-buttons button").forEach(b =>
+      b.classList.toggle("active", +b.dataset.leg === selectedLeg));
+  }
+  if (motionIndex() !== gi) $("motionGroup").value = String(gi + 1);
+  EDIT = { gi, si, ref: step };
+  SYNC_GUARD = true; renderMotionGroup(); applyFK(); SYNC_GUARD = false;  /* 载入期别反向覆盖表格 */
+  let msg = `已把 Step ${si+1} 填回表格：${hit} 个舵机`;
+  if (kept) msg += `；表格里另有 ${kept} 行本步未含（保留原值，更新时不会写入）`;
+  if (missing.length) msg += `；本步有 ${missing.length} 个舵机在表格里没有行（id ${missing.join(",")}）`;
+  if (clipped.length) msg += `；⚠ ${clipped.join("、")} 超出滑块范围，画布预览已夹住（表格原值不受影响）`;
+  msg += "。改完点这一步的「更新」覆盖，或「另存为新步」。";
+  show(msg); log(msg);
+}
+function updateStep() {
+  if (!EDIT) { show("当前不在编辑状态：先点某一步的「微调」"); return; }
+  if (!MOTIONS[EDIT.gi] || MOTIONS[EDIT.gi].steps[EDIT.si] !== EDIT.ref) {
+    EDIT = null; renderMotionGroup(); show("该步已被删除或调序，请重新载入"); return;
+  }
+  const elById = tableMap();
+  if (!elById.size) { show("手动表格是空的，无法更新"); return; }
+  const step = EDIT.ref, changed = [], missing = [];
+  /* 只写本步原有的舵机，表格里多出来的行不写入 —— 免得静默改变这一步的舵机构成 */
+  step.servos.forEach(sv => {
+    const el = elById.get(String(sv.id));
+    if (!el) { missing.push(sv.id); return; }
+    const pos = rowPos(el), time = rowTime(el);
+    if (pos !== +sv.pos || time !== +sv.time) {
+      changed.push({ id: sv.id, pos: [+sv.pos, pos], time: [+sv.time, time] });
+    }
+    sv.pos = pos; sv.time = time;
+  });
+  const extra = Array.from(elById.keys()).filter(id => !step.servos.some(sv => String(sv.id) === id)).length;
+  renderMotionGroup(); queueSave("motion_groups", MOTIONS);
+  let msg = `已用表格覆盖 Step ${EDIT.si+1}：${changed.length} 个舵机有变化`;
+  if (missing.length) msg += `；本步有 ${missing.length} 个舵机在表格里没有行（未改动 id ${missing.join(",")}）`;
+  if (extra) msg += `；表格里另有 ${extra} 行不属于本步（未写入，要存成新动作请用「另存为新步」）`;
+  show(msg); log(msg + (changed.length ? " -> " + JSON.stringify(changed) : ""));
+}
+function cancelEdit() { EDIT = null; renderMotionGroup(); }
+function saveAsNewStep() {                        /* 表格即编辑面，所以按表格内容存 */
+  const servos = collectRows();
+  if (!appendStep({ servos, delay_after: $("motionDelay").value })) return;
+  const gi = motionIndex(), si = currentMotion().steps.length - 1;
+  EDIT = { gi, si, ref: currentMotion().steps[si] };
+  renderMotionGroup(); show(`已按表格另存为 Step ${si+1} 并进入微调`);
 }
 function appendStep(step) {
   const g = currentMotion();
@@ -574,15 +1009,244 @@ function appendStep(step) {
   return true;
 }
 
+/* ---------------- 动作组本地回放：让画布跟着动作组动 ----------------
+   板端真值（main/control_http.c 的 sequence_task + main/servo_board.c 的 servo_board_move）：
+     for (每步) { 下发该步的 move 帧; 等 delay_after_ms; }        <- 不等舵机走完
+     舵机板按帧里的 time_ms，从"当前实际位置"插值到新目标
+   两条推论决定了画布该怎么画才叫"跟得上真狗"：
+     ① 一步占用的时间是 delay_after，不是 time；
+     ② delay_after < time 时这一步会被下一步中途截断，从半路接着走（不是跳到目标）。
+   所以这里不是"按步切动画"，而是逐舵机编出分段线性位置曲线，再按板端真实时刻取值。 */
+const PB = {
+  on: false, t0: 0, tLocal: 0, segs: null, marks: [], total: 0, settle: 0,
+  perRound: 0, roundIdx: 0, totalRounds: 1, device: "",
+  stepNow: -1, gi: 0, deliver: false, clipped: 0, unmapped: 0,
+  lastPaint: 0
+};
+
+/* 回放起点 = 画布当前姿态换算出的舵机位置：真狗也是从"现在所在的位置"开始走的 */
+function pbStartPos() {
+  const m = new Map();
+  IDS.forEach((id, i) => {
+    const li = Math.floor(i / 3), d = i % 3;
+    m.set(i, boardPos(li, d, A[li][DOF[d]]));
+  });
+  return m;
+}
+function pbBuild(steps, start) {
+  const ev = new Map();                 /* 关节下标 -> [{t,target,dur}]，按时间递增 */
+  const marks = [];
+  let at = 0, unmapped = 0;
+  steps.forEach((st, k) => {
+    const dly = clampInt(st && st.delay_after, 0, 60000);
+    marks.push({ at, dly });
+    ((st && st.servos) || []).forEach(sv => {
+      const i = servoIndexOf(sv.id);
+      if (i < 0) { unmapped++; return; }
+      if (!ev.has(i)) ev.set(i, []);
+      ev.get(i).push({ t: at, target: clampInt(sv.pos, 0, 1000),
+                       dur: clampInt(sv.time, 0, 65535) });
+    });
+    at += dly;
+  });
+  const segs = new Map();
+  let settle = at;                       /* 全部舵机真正停止的时刻（末步还要走完自己的 time） */
+  ev.forEach((list, i) => {
+    let p0 = start.has(i) ? start.get(i) : list[0].target;
+    const out = [];
+    for (let n = 0; n < list.length; n++) {
+      const e = list[n], nextT = n + 1 < list.length ? list[n + 1].t : Infinity;
+      const t1 = e.t + e.dur;
+      const endT = Math.min(t1, nextT);
+      /* 下一步在下发时刻就把目标改掉了 —— 从被截断时所在的位置接着走 */
+      const p1 = (e.dur > 0 && t1 > nextT)
+        ? p0 + (e.target - p0) * ((nextT - e.t) / e.dur) : e.target;
+      out.push({ t0: e.t, t1: endT, p0, p1 });
+      p0 = p1;
+    }
+    segs.set(i, out);
+    settle = Math.max(settle, out[out.length - 1].t1);
+  });
+  return { segs, marks, total: at, settle, unmapped };
+}
+/* 服务端 sequence_duration_ms 的同口径：每步 = max(该步最慢舵机的 time, delay_after)。
+   循环轮时长用它（预演时要跟真下发同一节奏）。 */
+function pbEstRound(steps) {
+  let t = 0;
+  steps.forEach(st => {
+    const sv = (st && st.servos) || [];
+    const slow = sv.length ? Math.max.apply(null, sv.map(x => clampInt(x.time, 0, 65535))) : 0;
+    t += Math.max(slow, clampInt(st && st.delay_after, 0, 60000));
+  });
+  return t;
+}
+function pbValueAt(list, t) {
+  let seg = null;
+  for (let i = 0; i < list.length; i++) { if (list[i].t0 <= t) seg = list[i]; else break; }
+  if (!seg) return list.length ? list[0].p0 : null;
+  if (t >= seg.t1) return seg.p1;
+  const span = seg.t1 - seg.t0;
+  return span > 0 ? seg.p0 + (seg.p1 - seg.p0) * ((t - seg.t0) / span) : seg.p1;
+}
+function pbStepAt(t) {
+  let k = -1;
+  for (let i = 0; i < PB.marks.length; i++) { if (PB.marks[i].at <= t) k = i; else break; }
+  return k;
+}
+function pbBegin(steps, o) {
+  o = o || {};
+  const b = pbBuild(steps, pbStartPos());
+  if (!b.marks.length) { show("没有可回放的步骤"); return false; }
+  PB.on = true;
+  PB.segs = b.segs; PB.marks = b.marks; PB.total = b.total; PB.unmapped = b.unmapped;
+  PB.settle = b.settle;
+  PB.t0 = o.t0 != null ? o.t0 : performance.now();
+  PB.totalRounds = o.rounds > 0 ? o.rounds : 0;            /* 0 = 不限轮次 */
+  const looped = (o.rounds === 0 || o.rounds > 1);
+  /* 预演也要跟真下发同一个节奏，所以用服务端同口径估算轮时长（不是本组 delay 之和） */
+  PB.perRound = looped ? (o.perRound > 0 ? o.perRound : pbEstRound(steps) + 50) : 0;
+  PB.roundIdx = 0;
+  PB.gi = motionIndex();
+  PB.device = $("device").value;
+  PB.deliver = !!o.deliver;
+  PB.stepNow = -1; PB.lastPaint = 0;
+  log("画布回放开始" + (PB.deliver ? "（已下发）" : "（仅本地预演，未下发）") + "："
+      + b.marks.length + " 步 / 本组 " + b.total + " ms"
+      + (PB.perRound ? "，循环 " + (PB.totalRounds || "∞") + " 轮（每轮 " + PB.perRound + " ms）" : ""));
+  pbTick(PB.t0);                                          /* 立刻画第一帧，别等下一帧 */
+  pbPaint(false);                                         /* 状态行也要立刻可见，不等 100ms 节流 */
+  return true;
+}
+function pbEnd(msg, force) {
+  if (!PB.on && !force) return;   /* force：本轮压根没跑起来（例如下发就失败了），也要把话说出来 */
+  PB.on = false;
+  document.querySelectorAll("#motionList .step").forEach(el => {
+    el.classList.remove("pb");
+    const bar = el.querySelector(".pb-bar i"); if (bar) bar.style.width = "0%";
+  });
+  const line = $("pbInfo");
+  if (msg) { line.classList.add("on"); line.innerHTML = "■ " + esc(msg); }
+  else line.classList.remove("on");
+  if (msg) log("画布回放结束：" + msg);
+}
+function pbTick(now) {
+  if (!PB.on) return;
+  const wall = now - PB.t0;
+  let t = wall, done = false;
+  if (PB.perRound > 0) {
+    const idx = Math.floor(wall / PB.perRound);
+    if (PB.totalRounds > 0 && idx >= PB.totalRounds) {
+      pbApply(PB.settle); syncLegUI(selectedLeg); draw();
+      pbEnd("已播完 " + PB.totalRounds + " 轮"); return;
+    }
+    PB.roundIdx = idx;
+    t = wall - idx * PB.perRound;
+    done = t >= PB.total;
+  } else if (wall >= PB.total) {
+    t = wall;              /* 不夹到 total：板子的任务虽已退出，末步的舵机还在走完自己的 time */
+    done = true;
+    if (wall >= PB.settle + 150) {
+      pbApply(PB.settle); syncLegUI(selectedLeg); draw();
+      pbEnd("本轮播放结束（末步走完后停在末姿态）"); return;
+    }
+  }
+  PB.tLocal = t;
+  PB.stepNow = pbStepAt(t);
+  pbApply(t);
+  syncLegUI(selectedLeg);
+  draw();
+  if (now - PB.lastPaint >= 100) {        /* 文本/进度条 10fps 就够，画布保留 60fps */
+    PB.lastPaint = now;
+    updatePayload();
+    pbPaint(done);
+  }
+}
+function pbApply(t) {
+  let clipped = 0;
+  PB.segs.forEach((list, i) => {
+    const pos = pbValueAt(list, t);
+    if (pos == null) return;
+    const c = CAL[i] || DEF_CAL()[i], k = (+c.dir) * (+c.scale);
+    if (!k) return;
+    const li = Math.floor(i / 3), d = i % 3;
+    const deg = (pos - (+c.neutral)) / k, lim = DEG_LIMIT[DOF[d]];
+    /* 不夹界：板子收到多少就走到多少，画布夹住反而把"这一步超范围"藏起来了 */
+    if (deg < lim[0] || deg > lim[1]) clipped++;
+    A[li][DOF[d]] = deg;
+  });
+  PB.clipped = clipped;
+}
+function pbPaint(done) {
+  const cur = PB.stepNow;
+  document.querySelectorAll("#motionList .step").forEach(el => {
+    const i = +el.dataset.step, on = i === cur;
+    if (el.classList.contains("pb") !== on) el.classList.toggle("pb", on);
+    const bar = el.querySelector(".pb-bar i");
+    if (!bar) return;
+    let w = 0;
+    if (on) {
+      const m = PB.marks[i];
+      w = m && m.dly > 0 ? clamp((PB.tLocal - m.at) / m.dly, 0, 1) * 100 : 100;
+    }
+    bar.style.width = w.toFixed(1) + "%";
+  });
+  const g = MOTIONS[PB.gi] || {};
+  const p = [PB.deliver ? "▶ 已下发，画布跟随回放" : "▶ 本地预演（未下发）"];
+  p.push((g.name || ("动作组 " + (PB.gi + 1))) + " · " + PB.marks.length + " 步");
+  p.push(done ? "本轮动作已走完" + (PB.perRound ? "，等服务端下一轮" : "")
+              : "Step " + (cur + 1) + "/" + PB.marks.length);
+  if (PB.perRound) p.push("第 " + (PB.roundIdx + 1) + "/" + (PB.totalRounds || "∞") + " 轮");
+  p.push((Math.min(PB.tLocal, PB.settle) / 1000).toFixed(2) + " / "
+       + ((PB.perRound || PB.settle) / 1000).toFixed(2) + " s");
+  const warn = [];
+  if (PB.clipped) warn.push(PB.clipped + " 个关节超出常规范围（按实际值画出）");
+  if (PB.unmapped) warn.push(PB.unmapped + " 个舵机不在 ID 列表，没画");
+  const line = $("pbInfo");
+  line.classList.add("on");
+  line.innerHTML = '<span class="nm">' + esc(p.join(" · ")) + "</span>"
+    + (warn.length ? ' <span style="color:var(--bad);">' + esc(warn.join("；")) + "</span>" : "");
+}
+/* 用服务端的 rounds 计数校正循环轮次。
+   服务端每轮的实际间隔 = 它估算的 per_round + 下发往返，比本地推算略长，
+   跑久了会攒出一个整轮的偏差。差到一整轮就把 t0 平移整数个轮周期：
+   轮次数回到正轨，而"本轮内的相位"保持不动 —— 所以画面上不会有肉眼可见的跳变。 */
+function pbSyncServer(sq) {
+  if (!PB.on || PB.perRound <= 0 || !PB.deliver || !sq) return;
+  const dev = sq.device_id || "";
+  if (dev && PB.device && dev !== PB.device) { pbEnd("目标设备已被别的下发占用"); return; }
+  const r = Number(sq.rounds) || 0;
+  if (!sq.running) {
+    if (PB.totalRounds > 0 && r >= PB.totalRounds) pbEnd("服务端循环已播完 " + r + " 轮");
+    else pbEnd("服务端循环已停止（已播 " + r + " 轮）");
+    return;
+  }
+  if (r <= 0) return;
+  /* rounds=r 表示"第 r 轮正在跑"，对应本地轮下标 r-1 */
+  const q = Math.floor((performance.now() - PB.t0) / PB.perRound);
+  if (q !== r - 1) PB.t0 += (q - (r - 1)) * PB.perRound;
+}
+
 /* ---------------- 网络动作 ---------------- */
-async function playSteps(steps, repeat) {
+async function playSteps(steps, repeat, deliver) {
   if (!steps || !steps.length) { show("没有可播放的步骤"); return; }
-  const body = { steps, device_id: $("device").value };
-  if (repeat === 0 || repeat > 1) { body.repeat = repeat === 0 ? true : repeat;
-    body.gap_ms = 50; }
-  const r = await POST("/api/v1/twin/sequence", body);
-  log("播放 -> " + JSON.stringify(r.data).slice(0, 300));
-  show(r.data);
+  deliver = !!deliver;              /* 由调用方指定：真下发 / 只预演，不再有全局开关 */
+  const looped = (repeat === 0 || repeat > 1);
+  const t0 = performance.now();          /* 以"下发前"为回放零点：板端收到就开跑 */
+  let perRound = 0;
+  if (deliver) {
+    const body = { steps, device_id: $("device").value };
+    if (looped) { body.repeat = repeat === 0 ? true : repeat; body.gap_ms = 50; }
+    const r = await POST("/api/v1/twin/sequence", body);
+    log("播放 -> " + JSON.stringify(r.data).slice(0, 300));
+    show(r.data);
+    /* 没落下去就别让画布自顾自地动 —— 那是最坏的结果：以为狗在走，其实没走 */
+    if (!r.ok || (r.data && r.data.error)) { pbEnd("下发失败，回放已停", true); return; }
+    if (looped) perRound = (Number(r.data.est_round_ms) || 0) + 50;
+  } else {
+    show("本地预演：只动画布，没有下发给真狗（要真跑请用「播放本组（下发）」）");
+  }
+  pbBegin(steps, { t0, rounds: looped ? (repeat === 0 ? 0 : repeat) : 1,
+                   perRound, deliver });
 }
 async function deployNow() {
   if (G.busy) return;
@@ -612,9 +1276,140 @@ async function readCurrentPose() {
   applyFK();
 }
 
+/* ---------------- 下发并读回校验 ---------------- */
+const VERIFY_TOL = 15;                 /* 舵机原始位置容差（0..1000 刻度） */
+let verifying = false;
+async function deployAndVerify() {
+  if (verifying) return;
+  verifying = true;
+  const btn = $("deployVerifyBtn"), out = $("verifyOut");
+  btn.disabled = true;
+  const dev = $("device").value;
+  if (!dev) {
+    out.innerHTML = '<div class="note">没有可用设备：板子需先连上音频 WS。</div>';
+    verifying = false; btn.disabled = false; return;
+  }
+  try {
+    const target = buildPayload().servos;
+    out.innerHTML = '<div class="note">① 下发中…</div>';
+    const mv = await POST("/api/v1/twin/servo/move", { servos: target, device_id: dev });
+    if (!mv.ok) {
+      out.innerHTML = '<div class="note">① 下发失败，没走到读回：<b>'
+        + esc(mv.data.error || ("HTTP " + mv.status)) + "</b></div>"
+        + (explain(mv) ? '<div class="note">' + esc(explain(mv)) + "</div>" : "");
+      return;
+    }
+    out.innerHTML = '<div class="note">② 等待动作完成（' + clampInt(G.moveMs, 0, 60000) + ' ms）…</div>';
+    await new Promise(r => setTimeout(r, clampInt(G.moveMs, 0, 60000) + 300));
+    out.innerHTML = '<div class="note">③ 读回位置…</div>';
+    const rd = await readPos();
+    if (!rd.ok) {
+      out.innerHTML = '<div class="note">③ 读回失败（下发本身成功）：<b>'
+        + esc(rd.data.error || ("HTTP " + rd.status)) + "</b></div>"
+        + (explain(rd) ? '<div class="note">' + esc(explain(rd)) + "</div>" : "");
+      return;
+    }
+    const got = new Map((rd.data.positions || []).map(p => [+p.id, +p.pos]));
+    renderVerify(target, got);
+  } finally {
+    verifying = false;
+    btn.disabled = false;
+  }
+}
+function renderVerify(target, got) {
+  let miss = 0, over = 0;
+  const rows = target.map(s => {
+    const has = got.has(+s.id);
+    const back = has ? got.get(+s.id) : null;
+    const d = has ? back - s.pos : null;
+    const bad = has && Math.abs(d) > VERIFY_TOL;
+    if (!has) miss++; else if (bad) over++;
+    return "<tr><td>ID " + s.id + "</td><td>" + s.pos + "</td>"
+      + '<td class="' + (has ? "" : "miss") + '">' + (has ? back : "无回包") + "</td>"
+      + '<td class="' + (bad ? "over" : "") + '">'
+      + (has ? (d > 0 ? "+" : "") + d : "—") + "</td>"
+      + "<td>" + (!has ? "缺" : (bad ? "偏差大" : "OK")) + "</td></tr>";
+  }).join("");
+  const sum = (miss || over)
+    ? '<div class="vfy-sum" style="color:var(--bad);">' + target.length + " 个舵机："
+      + over + " 个偏差超 ±" + VERIFY_TOL + "，" + miss + " 个没读回</div>"
+    : '<div class="vfy-sum" style="color:var(--ok);">' + target.length
+      + " 个舵机全部在容差内（±" + VERIFY_TOL + "）</div>";
+  $("verifyOut").innerHTML =
+    '<table class="vfy"><thead><tr><th>舵机</th><th>目标</th><th>读回</th><th>偏差</th><th>判定</th></tr></thead>'
+    + "<tbody>" + rows + "</tbody></table>" + sum;
+}
+
+/* ---------------- 板端日志（跟随目标设备） ---------------- */
+const TLOG_MAX = 400;
+const TLOG_HL = /(RX echo dropped|Drop invalid frame|TX:|RX:|servo_board:|E \(\d+\))/g;
+const TLOG = { dev: "", since: 0, total: 0, dropped: 0, lines: [], paused: false, err: "" };
+function tlogLevel(line) {
+  const m = /^([EWIVD])\s*\(/.exec(line);
+  return m ? m[1] : "";
+}
+function tlogRender() {
+  const box = $("tlog");
+  box.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  if (!TLOG.lines.length) {
+    const d = document.createElement("div");
+    d.className = "ln sys";
+    d.textContent = TLOG.err || "（暂无日志：确认板子已连上音频 WS）";
+    frag.appendChild(d);
+  } else {
+    for (const line of TLOG.lines) {
+      const lv = tlogLevel(line);
+      const d = document.createElement("div");
+      d.className = "ln" + (lv ? " lv-" + lv : "");
+      d.innerHTML = esc(line).replace(TLOG_HL, (m) => "<mark>" + m + "</mark>");
+      frag.appendChild(d);
+    }
+  }
+  box.appendChild(frag);
+  box.scrollTop = box.scrollHeight;
+  $("tlogStat").textContent = TLOG.total + " 行 · 板端丢弃 " + TLOG.dropped
+    + (TLOG.paused ? " · 已暂停（继续后会补上）" : "");
+}
+async function tlogPoll() {
+  if (TLOG.paused) return;
+  const dev = $("device").value;
+  $("tlogDev").textContent = dev ? "设备 " + dev : "（无目标设备）";
+  const q = "/api/v1/logs?since=" + TLOG.since
+    + (dev ? "&device=" + encodeURIComponent(dev) : "");
+  const r = await GET(q, { silent: true });
+  if (!r.ok) {
+    TLOG.err = "读取日志失败：" + (r.data.error || ("HTTP " + r.status));
+    tlogRender();
+    return;
+  }
+  const j = r.data;
+  if (j.device && j.device !== TLOG.dev) { TLOG.dev = j.device; TLOG.lines = []; TLOG.since = 0; }
+  TLOG.total = j.total || 0;
+  TLOG.dropped = j.dropped || 0;
+  const inc = j.lines || [];
+  if (inc.length) {
+    TLOG.lines = TLOG.lines.concat(inc);
+    if (TLOG.lines.length > TLOG_MAX) TLOG.lines = TLOG.lines.slice(-TLOG_MAX);
+    TLOG.err = "";
+  }
+  TLOG.since = j.next || TLOG.since;
+  if (inc.length || !TLOG.lines.length) tlogRender();
+}
+function tlogCopy() {
+  const txt = TLOG.lines.join("\n");
+  if (!txt) { show("还没有日志可复制"); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(
+      () => show("已复制 " + TLOG.lines.length + " 行"),
+      () => show("复制失败，请手动选中"));
+  } else { show("浏览器不支持剪贴板，请手动选中"); }
+}
+
 /* ---------------- 步态 ---------------- */
 function setSlider(k, v) { const el = $("g_" + k); if (el) { el.value = v; $(("g_"+k+"v")).textContent = k === "period" ? (+v).toFixed(2) : String(v); } }
 async function gaitStart() {
+  pbEnd("步态接管，画布回放停止");       /* 回放与步态都在写 A[]，只能有一个 */
   standPose();
   G.t = 0;
   G.last = performance.now();
@@ -635,34 +1430,14 @@ async function gaitStop() {
   log("步态停止 -> " + JSON.stringify(r.data).slice(0, 200));
   if (!r.ok) show(r.data);
 }
-function renderGaitState(s) {
-  const g = (s && s.gait) || {};
-  const sq = (s && s.sequence) || {};
-  const pill = (t, cls) => `<span class="pill ${cls}">${t}</span>`;
-  $("headPills").innerHTML =
-    pill(g.running ? "步态运行中" : "步态停止", g.running ? "on" : "") +
-    pill(sq.running ? `动作组循环中 ${sq.rounds}/${sq.total_rounds || "∞"}` : "动作组未循环",
-         sq.running ? "on" : "") +
-    pill(seqPlaying ? "板端序列播放中" : "板端空闲", seqPlaying ? "warn" : "") +
-    (g.running ? pill(`已下发 ${g.sent} 帧 / 失败 ${g.errors}`, g.errors ? "off" : "") : "");
-  const kv = $("gaitState");
-  const row = (k, v) => `<span>${k}</span><span class="mono">${v}</span>`;
-  kv.innerHTML = row("步态线程", g.running ? "运行中" : "已停止") +
-    row("已运行", (g.elapsed_s ?? 0) + " s") +
-    row("拍数", g.ticks ?? 0) + row("成功下发", g.sent ?? 0) +
-    row("失败", g.errors ?? 0) + row("最近错误", g.last_error || "—");
-  if (g.running && Array.isArray(g.angles) && g.angles.length === 4) {
-    A.forEach((a, i) => { const s2 = g.angles[i]; a.a0 = s2[0]; a.a1 = s2[1]; a.a2 = s2[2]; });
-    syncLegUI(selectedLeg); draw(); updatePayload();
-  }
-}
 async function poll() {
-  const s = await GET("/api/v1/twin/gait");
+  const s = await GET("/api/v1/twin/gait", { silent: true });
   if (s.ok) {
     serverGait = s.data;
     const running = !!(s.data.gait && s.data.gait.running);
     G.running = running || localGait;
     renderGaitState(s.data);
+    pbSyncServer(s.data.sequence);        /* 循环轮次靠服务端计数校正 */
   }
 }
 function renderGaitState(s) {
@@ -672,7 +1447,8 @@ function renderGaitState(s) {
   const playing = !!(s && s.target_playing_sequence);
   $("headPills").innerHTML =
     pill(g.running ? "步态运行中" : "步态停止", g.running ? "on" : "") +
-    pill(sq.running ? `动作组循环中 ${sq.rounds}/${sq.total_rounds || "∞"}` : "动作组未循环",
+    pill(sq.running ? `动作组循环中 ${sq.rounds}/${sq.total_rounds || "∞"}`
+        + (PB.on ? "（画布跟随）" : "（画布未跟随）") : "动作组未循环",
          sq.running ? "on" : "") +
     pill(s && s.target_busy
       ? `设备忙：${s.target_current || "占用中"}` : `设备${s && s.target_state || "未知"}`,
@@ -686,25 +1462,52 @@ function renderGaitState(s) {
     row("服务端角度", Array.isArray(g.angles) && g.angles[0]
       ? g.angles[0].map(x => (+x).toFixed(1)).join(" / ") + "（FL）" : "—");
 }
+let devSig = null;
 async function pollStatus() {
-  const r = await GET("/api/v1/twin/status");
-  if (!r.ok) return;
-  const sel = $("device"), cur = sel.value;
-  sel.innerHTML = (r.data.devices || []).map(d =>
-    `<option value="${d.device_id}">${d.device_id}${d.online ? "" : "（离线）"}</option>`).join("") ||
-    `<option value="">（无设备）</option>`;
-  sel.value = cur && (r.data.devices || []).some(d => d.device_id === cur)
-    ? cur : (r.data.target || "");
+  const r = await GET("/api/v1/twin/status", { silent: true });
+  const sel = $("device");
+  if (!r.ok) {
+    const why = r.status === 401 ? "未授权，请填 token" : "服务端不可达 " + r.status;
+    if (devSig !== "err:" + why) {
+      devSig = "err:" + why;
+      sel.innerHTML = '<option value="">（' + why + "）</option>";
+    }
+    setStale(true, why);
+    return;
+  }
+  const list = r.data.devices || [];
+  const sig = list.map(d => d.device_id + (d.online ? "1" : "0")).join("|");
+  if (devSig !== sig) {
+    devSig = sig;
+    const cur = sel.value;
+    sel.innerHTML = list.map(d =>
+      '<option value="' + d.device_id + '">' + d.device_id
+      + (d.online ? "" : "（离线）") + "</option>").join("")
+      || '<option value="">（无设备）</option>';
+    sel.value = cur && list.some(d => d.device_id === cur) ? cur : (r.data.target || "");
+  }
+  const anyOnline = list.some(d => d.online);
+  setStale(!anyOnline, anyOnline ? "" : "设备全部离线：画面为本地仿真，未连真狗");
   renderGaitState(r.data);
+}
+let staleOn = false;
+function setStale(on, why) {
+  if (staleOn === on && !on) return;
+  staleOn = on;
+  $("view").style.opacity = on ? "0.4" : "1";
+  $("staleTag").textContent = on ? (why || "设备离线") : "";
+  $("staleTag").style.display = on ? "block" : "none";
 }
 
 /* ---------------- 主循环 ----------------
    服务端在跑步态时，页面用同一套参数本地重算一遍只为把画面画顺（60fps）；
-   真正下发的是服务端线程，面板上的帧数/失败数才是真值。 */
+   真正下发的是服务端线程，面板上的帧数/失败数才是真值。
+   动作组回放（PB.on）与步态都在写 A[]，同一时刻只跑一个。 */
 let lastT = performance.now();
 function loop(now) {
   const dt = Math.min((now - lastT)/1000, 0.05);
   lastT = now;
+  if (PB.on) { pbTick(now); requestAnimationFrame(loop); return; }
   const serverRunning = !!(serverGait && serverGait.gait && serverGait.gait.running);
   if (localGait || serverRunning) {
     gaitStep(dt);
@@ -715,8 +1518,60 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
+/* ---------------- 请求流水 / 板端日志 / 步进 / 键盘 ---------------- */
+$("lgFilter").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-f]");
+  if (!b) return;
+  lgFilter = b.dataset.f;
+  [].slice.call($("lgFilter").querySelectorAll("button[data-f]"))
+    .forEach(x => x.classList.toggle("on", x === b));
+  renderLedger();
+});
+$("lgClear").onclick = () => { LEDGER = []; lgOpen.clear(); renderLedger(); };
+$("lgCopy").onclick = ledCopy;
+$("tlogPause").onclick = () => {
+  TLOG.paused = !TLOG.paused;
+  $("tlogPause").textContent = TLOG.paused ? "继续" : "暂停";
+  if (TLOG.paused) tlogRender(); else tlogPoll();
+};
+$("tlogClear").onclick = () => {
+  TLOG.lines = []; TLOG.since = 0; TLOG.err = ""; tlogRender();
+};
+$("tlogCopy").onclick = tlogCopy;
+
+/* 关节步进 */
+const DEG_LIMIT = { a0: [-60, 60], a1: [-120, 120], a2: [-150, 150] };
+function nudge(dof, delta) {
+  pbEnd("手动微调接管，画布回放停止");   /* 不然刚调的值会被回放的下一帧立刻盖掉 */
+  const lim = DEG_LIMIT[dof] || [-150, 150];
+  const next = clamp(Math.round(A[selectedLeg][dof] + delta), lim[0], lim[1]);
+  A[selectedLeg][dof] = next;
+  $(dof).value = next;
+  $(dof + "v").textContent = next;
+  updatePayload(); draw(); syncAnglesToTable();
+}
+[].slice.call(document.querySelectorAll(".steps")).forEach(g => {
+  const dof = g.dataset.dof;
+  [].slice.call(g.querySelectorAll("button[data-d]")).forEach(b => {
+    b.onclick = () => nudge(dof, parseInt(b.dataset.d, 10));
+  });
+});
+/* 键盘微调（焦点在输入控件内时不生效） */
+const KEY_DOF = { ArrowLeft: ["a0", -1], ArrowRight: ["a0", 1],
+                  ArrowUp: ["a1", 1], ArrowDown: ["a1", -1],
+                  ",": ["a2", -1], ".": ["a2", 1] };
+document.addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
+  const hit = KEY_DOF[e.key];
+  if (!hit) return;
+  e.preventDefault();
+  nudge(hit[0], hit[1] * (e.shiftKey ? 5 : 1));
+});
+
 /* ---------------- 事件绑定 ---------------- */
 $("deployBtn").onclick = deployNow;
+$("deployVerifyBtn").onclick = deployAndVerify;
 $("readPoseBtn").onclick = readCurrentPose;
 $("unloadBtn").onclick = async () => {
   localGait = false; G.running = false;
@@ -758,8 +1613,12 @@ $("mgSave").onclick = () => {
   currentMotion().name = $("motionName").value.trim() || currentMotion().name;
   renderMotionSelect(); renderMotionGroup(); queueSave("motion_groups", MOTIONS);
 };
-$("mgClear").onclick = () => { currentMotion().steps = []; renderMotionGroup(); queueSave("motion_groups", MOTIONS); };
-$("motionGroup").onchange = renderMotionGroup;
+$("mgClear").onclick = () => { currentMotion().steps = []; cancelEdit(); queueSave("motion_groups", MOTIONS); };
+$("motionGroup").onchange = () => { EDIT = null; renderMotionGroup(); };
+/* 动作步微调：写回 / 另存 / 退出 */
+$("editUpdate").onclick = updateStep;
+$("editSaveAs").onclick = saveAsNewStep;
+$("editCancel").onclick = cancelEdit;
 $("capManual").onclick = () => appendStep({ servos: collectRows(), delay_after: $("motionDelay").value });
 $("capPose").onclick = () => appendStep({ servos: buildPayload().servos, delay_after: $("motionDelay").value });
 $("capTrue").onclick = async () => {
@@ -775,13 +1634,21 @@ $("dropStep").onclick = () => {
   const g = currentMotion(); if (g.steps.length) g.steps.pop();
   renderMotionGroup(); queueSave("motion_groups", MOTIONS);
 };
-$("playGroup").onclick = () => {
+/* 「播放本组（下发）」与「本地预演」共用同一条时序，区别只有发不发包 */
+function playGroupAs(deliver) {
   const g = currentMotion();
   if (!g.steps.length) { show("当前动作组为空"); return; }
   const repeat = $("motionRepeat").checked ? 0 : clampInt($("motionCount").value, 1, 9999);
-  playSteps(g.steps, repeat);
-};
+  playSteps(g.steps, repeat, deliver);
+}
+$("playGroup").onclick = () => playGroupAs(true);
+$("previewGroup").onclick = () => playGroupAs(false);
 $("stopGroup").onclick = async () => {
+  const delivered = PB.deliver;
+  pbEnd("已手动停止");
+  /* 只有真下发过（或服务端确实在循环）才去戳板子；纯预演点「停止」不该白换一个错回来 */
+  const playing = !!(serverGait && serverGait.sequence && serverGait.sequence.running);
+  if (!delivered && !playing) { show("画布回放已停（本次没下发过，无需通知板子）"); return; }
   const r = await POST("/api/v1/twin/sequence/stop", { device_id: $("device").value });
   log("停止序列 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
 };
@@ -796,6 +1663,7 @@ $("calReset").onclick = async () => {
   if (r.ok) { applyStore(r.data.store); show("标定已重置"); }
 };
 $("estop").onclick = async () => {
+  pbEnd("急停：画布回放停止");
   localGait = false; G.running = false;
   const r = await POST("/api/v1/twin/estop", { device_id: $("device").value });
   log("急停 -> " + JSON.stringify(r.data).slice(0, 200)); show(r.data);
@@ -843,6 +1711,7 @@ $("qpDemo").onclick = () => {
 };
 
 ["a0","a1","a2"].forEach(k => $(k).addEventListener("input", e => {
+  pbEnd("手动微调接管，画布回放停止");
   A[selectedLeg][k] = +e.target.value;
   $(k + "v").textContent = e.target.value;
   updatePayload(); draw();
@@ -899,7 +1768,10 @@ function applyPort(p, silent) {
 $("portGo").onclick = () => applyPort(parseInt($("portInput").value, 10) || PORT);
 document.querySelectorAll(".portsel .pbtn").forEach(b =>
   b.onclick = () => applyPort(+b.dataset.port));
-$("device").onchange = () => { pollStatus(); log("目标设备 -> " + $("device").value); };
+$("device").onchange = () => {
+  pbEnd("目标设备已切换，画布停止回放");   /* 画布现在代表另一条狗了 */
+  pollStatus(); log("目标设备 -> " + $("device").value);
+};
 
 (async function boot() {
   try {
@@ -916,6 +1788,8 @@ $("device").onchange = () => { pollStatus(); log("目标设备 -> " + $("device"
   window.addEventListener("resize", resize);
   setInterval(poll, 1000);          // 步态线程计数：1s 一次够用
   setInterval(pollStatus, 2000);    // 设备与占用状态：2s 一次
+  setInterval(tlogPoll, 1500);      // 板端日志增量：1.5s 一次
+  renderLedger();
   requestAnimationFrame(loop);
 })();
 </script>
