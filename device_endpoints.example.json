@@ -1,0 +1,14 @@
+{
+  "_说明": "样例文件。首次部署时复制为 device_endpoints.json：cp device_endpoints.example.json device_endpoints.json。真实文件已被 .gitignore 排除——板子每次 hello 都会重写它（含内网 IP），进仓库只会反复变脏。",
+  "_放置目录": "与 servev1.py 同级（相对路径，换目录启动会读写错位）",
+  "_自动写入时机": "板端 WebSocket 握手发 hello 时由服务端落盘，条目不会过期",
+  "_键名": "设备 ws hello 里上报的 device_id，形如 esp32s3-<MAC 后若干位>",
+
+  "esp32s3-000000000000": {
+    "host": "192.168.137.2",
+    "port": 80,
+    "token": "",
+    "auto": true,
+    "last_seen": "2026-01-01T00:00:00Z"
+  }
+}

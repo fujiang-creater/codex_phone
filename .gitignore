@@ -18,3 +18,7 @@ firmware/**/*.bin
 
 # 集群广播开关：运行时状态，与 twin_store.json 同类。
 cluster.json
+
+# 设备端点表：板子一 hello 就写hosts/IP，且没有过期机制（假板子也会污染)。
+# 首次部署请 cp device_endpoints.example.json device_endpoints.json
+device_endpoints.json
