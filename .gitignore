@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 record_*.wav
 _test_*.py
+_demo_*.py
 *.log
 llm_config.json
 # 孪生运行时状态（本机标定/几何/动作组），结构见 twin_store.example.json
@@ -9,3 +10,11 @@ twin_store.json
 # OTA 固件镜像：1.3MB 二进制且每次 idf.py build 都变，不进仓库。
 # 放置规则：firmware/esp32s3/<版本>/app.bin（用板端 build/esp32s3n16r8_idf.bin）
 firmware/**/*.bin
+
+# 改动前的手工备份（命名约定 *.bak.<日期>-<用途>）。只在本机保留，
+# 需要留档的旧版本走 git 历史，不要靠这些副本。
+*.bak
+*.bak.*
+
+# 集群广播开关：运行时状态，与 twin_store.json 同类。
+cluster.json
