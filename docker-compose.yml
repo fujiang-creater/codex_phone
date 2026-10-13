@@ -1,0 +1,33 @@
+# 机器狗服务端 · docker compose（Linux 目标）
+# ----------------------------------------------------------------------------
+# ⚠ 必须用 host 网络：_lan_ip_for() 要靠宿主网卡挑一个"与板子同网段"的本机 IP，
+#   下发给板子的 OTA 固件 URL 才有效。桥接模式下容器只有 172.17.0.x，
+#   三级判据（同 /24 → 192.168.* → local_ips()[0] 兜底）全部落空，
+#   固件 URL 会变成容器内网地址 → 板子下载 404；而 :8765 有端口映射照常通，
+#   表现为"能连上、能对话，只有 OTA 失败"的半通状态，非常难查。
+#   用了 host 网络就不要再写 ports:（重复且会报冲突）。
+#
+# 模型缓存约 901MB，放命名卷、不烤进镜像 → 换机器时只需搬镜像，不用重下模型。
+
+services:
+  serve:
+    build: .
+    image: dog-server:latest
+    container_name: dog-server
+    network_mode: host
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      # 大模型对话无需显式开：./llm_config.json（已挂载）里配好 api_key 即自动启用。
+      # 想强制关掉就设 DOG_BRAIN: "0"；只想看页面/调前端则给 command 加 --ctrl-only。
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      # 代码 + 密钥 + 运行时状态都留在宿主机：改完 servev1.py 只需 docker compose restart
+      - ./:/app
+      # FunASR 模型缓存（SenseVoiceSmall + FSMN-VAD）
+      - modelscope-cache:/root/.cache/modelscope
+    command: ["python", "-u", "servev1.py"]
+
+volumes:
+  modelscope-cache:

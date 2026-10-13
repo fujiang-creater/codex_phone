@@ -1,0 +1,28 @@
+# 构建上下文排除清单（.dockerignore）
+
+# 版本库与编辑器
+.git
+.gitignore
+.idea/
+.vscode/
+
+# ⚠ 密钥与运行时状态：绝不能烤进镜像（镜像分层是可以被挖出来的，事后 rm 也删不掉）
+llm_config.json
+device_endpoints.json
+devices.json
+twin_store.json
+
+# 固件二进制：运行期手工更新，用卷挂载（firmware.json 索引仍会进镜像）
+firmware/**/*.bin
+*.bin
+
+# Windows 专有与本地日志
+opus.dll
+*.log
+.server_*.log
+
+# Python 产物
+__pycache__/
+*.pyc
+.venv/
+venv/
