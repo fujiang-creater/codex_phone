@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'term.html': '/term' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/term'));
+})();
+</script>
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗 · 网络日志终端</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --warn: #d97706; --bad: #dc2626; --ok: #0f9d58;
+    --term-bg: #0f172a; --term-ink: #cbd5e1; --term-dim: #64748b;
+    --lv-e: #fca5a5; --lv-w: #fcd34d; --lv-i: #bfdbfe; --lv-d: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px;
+    height: 100vh; display: flex; flex-direction: column; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 12px 20px; flex: none; }
+  header h1 { margin: 0; font-size: 16px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .bar { flex: none; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 9px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+  select, input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px;
+    font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+  select { min-width: 210px; }
+  input#q { width: 220px; }
+  input#tok { width: 120px; font-size: 11px; color: var(--muted); }
+  button { cursor: pointer; border: none; border-radius: 7px; padding: 6px 11px; font-size: 13px;
+    font-weight: 600; color: var(--accent); background: #eef2ff; }
+  button:hover { background: #e0e7ff; }
+  button.on { background: var(--accent); color: #fff; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(15,157,88,.15); }
+  .spacer { flex: 1; }
+  .stat { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+
+  .notice { flex: none; padding: 7px 20px; font-size: 12.5px; display: none; }
+  .notice.warn { background: #fffbeb; color: #92400e; border-bottom: 1px solid #fde68a; display: block; }
+  .notice.bad { background: #fef2f2; color: #991b1b; border-bottom: 1px solid #fecaca; display: block; }
+
+  #term { flex: 1; overflow-y: auto; background: var(--term-bg); color: var(--term-ink);
+    font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; font-size: 12.5px;
+    line-height: 1.55; padding: 10px 14px; white-space: pre; }
+  #term.wrap { white-space: pre-wrap; word-break: break-word; }
+  .ln { display: block; }
+  .ln.lv-E { color: var(--lv-e); }
+  .ln.lv-W { color: var(--lv-w); }
+  .ln.lv-I { color: var(--lv-i); }
+  .ln.lv-D, .ln.lv-V { color: var(--lv-d); }
+  .ln.sys { color: #64748b; font-style: italic; }
+  .ln mark { background: #fde68a; color: #0f172a; border-radius: 2px; }
+  #term .empty { color: var(--term-dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>网络日志终端</h1>
+  <div class="sub">板端 ESP_LOG 经 WS 实时上传 —— 等价于串口 monitor，但不需要接线，也不影响音频链路</div>
+  <div class="sub" style="margin-top:5px;"><a href="portal.html">← 返回服务台主页</a></div>
+</header>
+
+<div class="bar">
+  <span id="dot" class="dot"></span>
+  <select id="dev"><option value="">（加载中…）</option></select>
+  <input id="q" placeholder="过滤关键字（空格分隔，需全部命中）" />
+  <select id="lvl">
+    <option value="">全部级别</option>
+    <option value="E">只看 ERROR</option>
+    <option value="W">WARN 及以上</option>
+    <option value="I">INFO 及以上</option>
+  </select>
+  <button id="btnPause">暂停跟随</button>
+  <button id="btnWrap">自动换行</button>
+  <button id="btnClear">清屏</button>
+  <button id="btnSave">导出日志</button>
+  <span class="spacer"></span>
+  <span id="stat" class="stat">—</span>
+  <input id="tok" title="Bearer Token（开发模式任意非空即可）" />
+</div>
+
+<div id="notice" class="notice"></div>
+<div id="term"><span class="empty">等待板端日志…</span></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var MAX_DOM_LINES = 4000;      // 终端区最多保留多少个 <div>，再多就砍最旧的
+  var POLL_MS = 500;
+
+  var S = {
+    dev: '', since: 0, total: 0, dropped: 0, seq: 0,
+    paused: false, wrap: false, timer: null, lines: [], fails: 0,
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var term = $('term'), devSel = $('dev'), notice = $('notice'), stat = $('stat');
+
+  function token() { return ($('tok').value || '').trim() || 'x'; }
+  var wantEscape = false;
+
+  function esc(s) {
+    return s.replace(/[&<>]/g, function (c) {
+      return c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;';
+    });
+  }
+
+  /* ESP_LOG 的行首是 "I (12345) TAG: msg"，取首字母定颜色。 */
+  function levelOf(line) {
+    var m = /^([EWIVD])\s*\(/.exec(line);
+    return m ? m[1] : '';
+  }
+
+  function termAtBottom() {
+    return term.scrollHeight - term.scrollTop - term.clientHeight < 10;
+  }
+
+  function follow() { return !S.paused; }
+
+  function scrollIfNeeded() {
+    if (follow()) term.scrollTop = term.scrollHeight;
+  }
+
+  function passes(line) {
+    var lvl = $('lvl').value;
+    if (lvl) {
+      var l = levelOf(line);
+      var rank = { E: 0, W: 1, I: 2, D: 3, V: 4 };
+      var want = { E: 0, W: 1, I: 2 }[lvl];
+      if (l === '') return false;                 // 非标准日志行在级别筛选下隐藏
+      if (rank[l] > want) return false;
+    }
+    var q = $('q').value.trim().toLowerCase();
+    if (!q) return true;
+    var low = line.toLowerCase();
+    var parts = q.split(/\s+/);
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] && low.indexOf(parts[i]) === -1) return false;
+    }
+    return true;
+  }
+
+  function appendLines(lines) {
+    if (!lines.length) return;
+    var empty = term.querySelector('.empty');
+    if (empty) term.removeChild(empty);
+
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      S.lines.push(line);
+      if (!passes(line)) continue;
+      var d = document.createElement('div');
+      var lv = levelOf(line);
+      d.className = 'ln' + (lv ? ' lv-' + lv : '');
+      d.innerHTML = esc(line);
+      frag.appendChild(d);
+    }
+    term.appendChild(frag);
+
+    /* 只砍超量的行，不清空重绘：重绘会让滚动位置和用户回看全都丢掉。 */
+    while (term.childNodes.length > MAX_DOM_LINES) {
+      term.removeChild(term.firstChild);
+    }
+    if (S.lines.length > MAX_DOM_LINES * 3) {
+      S.lines = S.lines.slice(-MAX_DOM_LINES * 2);
+    }
+    scrollIfNeeded();
+    updateStat();
+  }
+
+  function sysLine(text) {
+    var d = document.createElement('div');
+    d.className = 'ln sys';
+    d.textContent = text;
+    term.appendChild(d);
+    scrollIfNeeded();
+  }
+
+  function updateStat() {
+    var t = new Date();
+    var hh = ('0' + t.getHours()).slice(-2), mm = ('0' + t.getMinutes()).slice(-2),
+        ss = ('0' + t.getSeconds()).slice(-2);
+    stat.textContent = S.total + ' 行 · 板端丢弃 ' + S.dropped + ' · ' + hh + ':' + mm + ':' + ss;
+  }
+
+  function showNotice(kind, text) {
+    notice.className = 'notice' + (kind ? ' ' + kind : '');
+    notice.textContent = text || '';
+  }
+
+  function fillDevices(list, keep) {
+    if (!list || !list.length) {
+      if (!keep) devSel.innerHTML = '<option value="">（暂无设备上报日志）</option>';
+      return;
+    }
+    var sig = list.map(function (d) { return d.device_id + (d.online ? '1' : '0'); }).join('|');
+    if (devSel.getAttribute('data-sig') === sig) return;
+    devSel.setAttribute('data-sig', sig);
+    var cur = S.dev;
+    devSel.innerHTML = '';
+    list.forEach(function (d) {
+      var o = document.createElement('option');
+      o.value = d.device_id;
+      o.textContent = d.device_id + (d.online ? ' · 在线' : ' · 离线');
+      devSel.appendChild(o);
+    });
+    if (cur && list.some(function (d) { return d.device_id === cur; })) devSel.value = cur;
+    else { devSel.value = list[0].device_id; S.dev = list[0].device_id; S.since = 0; }
+  }
+
+  function switchDevice(id) {
+    S.dev = id; S.since = 0; S.total = 0; S.dropped = 0; S.lines = [];
+    term.innerHTML = '<span class="empty">等待板端日志…</span>';
+    devSel.setAttribute('data-sig', '');
+    showNotice('', '');
+    poll();
+  }
+
+  async function poll() {
+    var url = 'api/v1/logs?since=' + S.since +
+              (S.dev ? '&device=' + encodeURIComponent(S.dev) : '');
+    try {
+      var r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token() } });
+      if (!r.ok) {
+        S.fails++;
+        if (S.fails === 3) showNotice('bad', '读取日志失败（HTTP ' + r.status + '）' +
+          (r.status === 401 ? '：请在右侧填 Token，或改用任意非空字符串。' : ''));
+        return;
+      }
+      var j = await r.json();
+      S.fails = 0;
+
+      var online = (j.devices || []).some(function (d) {
+        return d.device_id === j.device && d.online;
+      });
+      $('dot').className = 'dot' + (online ? ' on' : '');
+
+      fillDevices(j.devices, true);
+      if (j.device && j.device !== S.dev) { S.dev = j.device; devSel.value = j.device; }
+
+      S.total = j.total || 0;
+      S.dropped = j.dropped || 0;
+      S.seq = j.seq || 0;
+      S.since = j.next || 0;
+
+      appendLines(j.lines || []);
+
+      if (S.dropped > 0) {
+        showNotice('warn', '板端环形缓冲溢出过，已丢弃 ' + S.dropped +
+          ' 行 —— 日志视图不完整（重启板子可从开机第一行看起）');
+      } else if (!online && S.total > 0) {
+        showNotice('warn', '该设备当前不在线，下面是它断线前最后收到的日志（已缓存 ' +
+          S.total + ' 行）');
+      } else {
+        showNotice('', '');
+      }
+    } catch (e) {
+      S.fails++;
+      if (S.fails === 3) showNotice('bad', '与服务端通信失败：' + e.message);
+    }
+  }
+
+  /* ---- 交互 ---- */
+  devSel.onchange = function () { switchDevice(devSel.value); };
+
+  $('btnPause').onclick = function () {
+    S.paused = !S.paused;
+    this.className = S.paused ? 'on' : '';
+    this.textContent = S.paused ? '继续跟随' : '暂停跟随';
+    scrollIfNeeded();
+  };
+
+  $('btnWrap').onclick = function () {
+    S.wrap = !S.wrap;
+    term.classList.toggle('wrap', S.wrap);
+    this.className = S.wrap ? 'on' : '';
+  };
+
+  $('btnClear').onclick = function () {
+    S.lines = [];
+    term.innerHTML = '';
+    sysLine('— 已清屏（板端不受影响，新日志继续进来）—');
+  };
+
+  $('btnSave').onclick = function () {
+    var text = S.lines.join('\n');
+    if (!text) { sysLine('— 还没有日志可导出 —'); return; }
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var a = document.createElement('a');
+    var t = new Date();
+    var stamp = t.getFullYear() + ('0' + (t.getMonth() + 1)).slice(-2) +
+                ('0' + t.getDate()).slice(-2) + '-' +
+                ('0' + t.getHours()).slice(-2) + ('0' + t.getMinutes()).slice(-2) +
+                ('0' + t.getSeconds()).slice(-2);
+    a.href = URL.createObjectURL(blob);
+    a.download = 'dog-log-' + (S.dev || 'device') + '-' + stamp + '.txt';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  /* 过滤条件变化就地重绘（数据仍在 S.lines 里，不丢）。 */
+  function redraw() {
+    var keep = S.lines.slice();
+    term.innerHTML = '';
+    S.lines = [];
+    if (!keep.length) { term.innerHTML = '<span class="empty">等待板端日志…</span>'; return; }
+    appendLines(keep);
+  }
+  $('q').oninput = redraw;
+  $('lvl').onchange = redraw;
+
+  /* 往上翻时自动停跟随，滚回底部自动恢复：不需要用户先去点按钮。 */
+  term.addEventListener('scroll', function () {
+    if (S.paused) return;
+    if (!termAtBottom()) {
+      S.paused = true;
+      $('btnPause').className = 'on';
+      $('btnPause').textContent = '继续跟随';
+    }
+  });
+  term.addEventListener('wheel', function () { wantEscape = true; }, { passive: true });
+
+  $('tok').value = (function () {
+    try { return localStorage.getItem('dog_sd_token') || 'x'; } catch (e) { return 'x'; }
+  })();
+  $('tok').onchange = function () {
+    try { localStorage.setItem('dog_sd_token', this.value.trim()); } catch (e) { /* 忽略 */ }
+    S.since = 0; poll();
+  };
+
+  /* ---- 启动 ---- */
+  poll();
+  S.timer = setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

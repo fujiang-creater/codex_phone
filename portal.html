@@ -8,7 +8,8 @@
 (function () {
   if (location.protocol !== 'file:') return;
   var MAP = { 'portal.html': '/', 'ctrl.html': '/ctrl', 'index_ctrl.html': '/ctrl',
-              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice' };
+              'brain.html': '/brain', 'twin.html': '/twin', 'index.html': '/voice',
+              'sdcard.html': '/sdcard' };
   var f = (location.pathname.split('/').pop() || '').toLowerCase();
   location.replace('http://127.0.0.1:8000' + (MAP[f] || '/'));
 })();
@@ -41,6 +42,8 @@
   .card.ctrl .ico{background:#e3f7f5;color:var(--accent2);}
   .card.brain .ico{background:#ede9fe;color:#7c3aed;}
   .card.twin .ico{background:#fdf3e3;color:#b45309;}
+  .card.sdcard .ico{background:#e9f7ec;color:#15803d;}
+  .card.term .ico{background:#e2e8f0;color:#334155;}
   .card h2{margin:0 0 8px;font-size:18px;}
   .card ul{margin:6px 0 0;padding-left:18px;color:var(--dim);font-size:13px;line-height:1.7;}
   footer{margin-top:34px;color:var(--dim);font-size:12.5px;line-height:1.8;}
@@ -96,6 +99,28 @@
         <li>trot 步态跑在服务端线程（页面关掉也在走）</li>
         <li>动作组与标定落盘，可备份、大模型可读</li>
         <li>原板端页面已缩水为急救页</li>
+      </ul>
+    </a>
+
+    <a class="card sdcard" href="sdcard.html">
+      <div class="ico">💾</div>
+      <h2>SD 卡文件控制台</h2>
+      <ul>
+        <li>浏览板子 SD 卡里的目录与文件</li>
+        <li>上传 / 下载 / 改名 / 删除 / 新建目录</li>
+        <li>显示挂载状态与剩余容量（有的设备不带卡）</li>
+        <li>需板端固件含 <code>/api/sd/*</code> 接口</li>
+      </ul>
+    </a>
+
+    <a class="card term" href="term.html">
+      <div class="ico">🖥️</div>
+      <h2>网络日志终端</h2>
+      <ul>
+        <li>板端日志经 WS 实时上传，等价于串口 monitor</li>
+        <li>级别着色 / 关键字过滤 / 暂停跟随 / 导出</li>
+        <li>开机自检、SD 挂载、WiFi 全程可见</li>
+        <li>需板端固件含 <code>log_bridge</code>（1.0.4+）</li>
       </ul>
     </a>
   </div>

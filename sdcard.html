@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<script>
+/* 本地双击（file://）打开时自动跳到服务端地址：
+   file 协议下 href="/xxx" 会被解析成盘根，fetch 也无法跨协议工作。
+   正常经 http://127.0.0.1:8000/sdcard 访问时此段不执行。 */
+(function () {
+  if (location.protocol !== 'file:') return;
+  var MAP = { 'sdcard.html': '/sdcard' };
+  var f = (location.pathname.split('/').pop() || '').toLowerCase();
+  location.replace('http://127.0.0.1:8000' + (MAP[f] || '/sdcard'));
+})();
+</script>
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>机器狗 · SD 卡文件控制台</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --ink: #1f2933; --muted: #6b7785;
+    --line: #e3e8ef; --accent: #2563eb; --accent2: #0f9d58;
+    --warn: #d97706; --bad: #dc2626; --ok: #0f9d58; --busy: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { display: grid; grid-template-columns: 1.7fr 1fr; gap: 16px; padding: 16px 20px;
+    align-items: start; }
+  @media (max-width: 1000px) { .wrap { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 12px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, select { width: 100%; padding: 7px 9px; border: 1px solid var(--line);
+    border-radius: 7px; font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 130px; }
+  button { cursor: pointer; border: none; border-radius: 7px; padding: 8px 12px; font-size: 13px;
+    font-weight: 600; color: #fff; background: var(--accent); }
+  button.ghost { background: #eef2ff; color: var(--accent); }
+  button.green { background: var(--accent2); }
+  button.warn { background: var(--warn); }
+  button.red { background: var(--bad); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toolbar .spacer { flex: 1; }
+  .crumb { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 13px;
+    padding: 8px 10px; background: #f8fafc; border: 1px solid var(--line);
+    border-radius: 7px; margin: 10px 0; min-height: 38px; }
+  .crumb .seg { cursor: pointer; color: var(--accent); }
+  .crumb .seg:hover { text-decoration: underline; }
+  .crumb .sep { color: var(--muted); }
+  .crumb .cur { color: var(--ink); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line);
+    vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:hover td { background: #fafcff; }
+  td.act { white-space: nowrap; text-align: right; }
+  .name { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+  .ico { width: 16px; height: 16px; flex: none; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 18px 6px; text-align: center; }
+  .banner { border-radius: 9px; padding: 10px 12px; font-size: 13px; margin-bottom: 12px;
+    border: 1px solid transparent; }
+  .b-info { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+  .b-warn { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+  .b-bad { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+  .b-ok { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .bar { height: 7px; border-radius: 999px; background: #e5e9f0; overflow: hidden;
+    margin-top: 8px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); width: 0; }
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; }
+  .t-ok { background: #dcfce7; color: var(--ok); }
+  .t-off { background: #f1f5f9; color: var(--muted); }
+  .t-warn { background: #fef3c7; color: var(--warn); }
+  .t-bad { background: #fee2e2; color: var(--bad); }
+  #log { background: #0f172a; color: #d1e0ff; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; border-radius: 8px; padding: 10px; height: 200px; overflow: auto;
+    white-space: pre-wrap; }
+  .ok { color: var(--ok); } .err { color: var(--bad); } .warn { color: var(--warn); }
+  /* 自定义弹窗（不用原生 confirm：观感与整站一致，且能容纳单个输入框） */
+  #mask { position: fixed; inset: 0; background: rgba(15,23,42,.42); display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+  #mask.on { display: flex; }
+  #modal { background: #fff; border-radius: 12px; width: 100%; max-width: 420px;
+    padding: 18px 20px; box-shadow: 0 18px 48px rgba(15,23,42,.22); }
+  #modal h3 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+  #modal p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.6;
+    white-space: pre-line; }
+  #modal .field { margin-top: 12px; }
+  #modal .foot { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>机器狗 · SD 卡文件控制台</h1>
+  <div class="sub">经服务端转发到板端 <code>HTTP /api/sd/*</code> · 文件纯流式透传，不在服务端落盘</div>
+  <div class="sub" style="margin-top:8px;"><a href="portal.html">← 返回服务台主页</a></div>
+</header>
+
+<div class="wrap">
+  <!-- 左：文件浏览 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>SD 卡内容</h2>
+      <div id="banner" class="banner b-info">正在读取设备状态…</div>
+      <div class="toolbar">
+        <button id="btnUp" class="ghost">↑ 上一级</button>
+        <button id="btnRefresh" class="ghost">刷新</button>
+        <button id="btnMkdir" class="ghost">新建文件夹</button>
+        <button id="btnPick" class="green">上传文件</button>
+        <input id="fileInput" type="file" multiple style="display:none" />
+        <span class="spacer"></span>
+        <span id="countInfo" class="muted" style="font-size:12px;"></span>
+      </div>
+      <div id="upbox" style="display:none; margin-top:10px;">
+        <div class="row" style="align-items:center;">
+          <span id="upName" class="mono" style="flex:3;"></span>
+          <span id="upText" class="muted" style="flex:1; text-align:right; font-size:12px;"></span>
+        </div>
+        <div class="bar"><i id="upBar"></i></div>
+      </div>
+      <div id="crumb" class="crumb"><span class="cur">/</span></div>
+      <table>
+        <thead>
+          <tr><th style="width:58%;">名称</th><th style="width:16%;">大小</th>
+              <th style="width:26%;">修改时间</th><th style="width:1px;"></th></tr>
+        </thead>
+        <tbody id="tbody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+      </table>
+      <div class="hint">
+        首版仅支持英文数字文件名（板端 FATFS 代码页为 437，中文名会乱码）。
+        上传为整体覆盖写入：板端先写 <code>.part</code> 再改名，断电不会留下半截文件。
+      </div>
+    </div>
+    <div class="card">
+      <h2>操作日志</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- 右：连接 / 状态 -->
+  <div style="display:flex; flex-direction:column; gap:16px;">
+    <div class="card">
+      <h2>连接 / 鉴权</h2>
+      <label>目标设备</label>
+      <select id="device"><option value="">（加载中…）</option></select>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+        <span id="devState" class="tag t-off">未知</span>
+        <span id="base" class="muted mono" style="font-size:11px;"></span>
+      </div>
+      <!-- 实时显示服务端真正拿去连板子的地址（端点表）+ 板子自报的地址；
+           两者不一致时这里会直接标红 —— 以前页面上根本看不到前者，
+           板子换过 DHCP 地址后就只能靠猜。 -->
+      <div id="epInfo" class="muted mono" style="font-size:11px; margin-top:4px; line-height:1.5;"></div>
+      <label>Token（Bearer）</label>
+      <input id="token" value="dev-token-change-me" />
+      <div class="toolbar" style="margin-top:10px;">
+        <button id="btnSaveToken" class="ghost">记住 Token</button>
+        <button id="btnReload" class="ghost">重新检测</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>SD 卡状态</h2>
+      <div class="kv">
+        <span class="k">挂载</span><span id="sdMount" class="muted">—</span>
+        <span class="k">容量</span><span id="sdSize" class="muted">—</span>
+        <span class="k">剩余</span><span id="sdFree" class="muted">—</span>
+        <span class="k">单文件上限</span><span id="sdMax" class="muted">—</span>
+      </div>
+      <div class="bar" id="sdBarBox" style="display:none;"><i id="sdBar"></i></div>
+    </div>
+
+    <div class="card">
+      <h2>说明</h2>
+      <div class="hint" style="margin-top:0;">
+        · 设备下拉里带 <span class="tag t-ok">卡</span> 的表示该设备已上报「已挂载 SD 卡」。<br />
+        · 板子需先连上音频 WS，服务端才会记下它的 IP；否则提示「端点未知」。<br />
+        · 固件提示 <code>SD_NOT_SUPPORTED</code> 时，说明当前固件还没有 <code>/api/sd/*</code> 接口。<br />
+        · 所有请求都经服务端代理，浏览器不需要知道板子的 IP。
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="mask">
+  <div id="modal">
+    <h3 id="mTitle">确认</h3>
+    <p id="mText"></p>
+    <div class="field" id="mField" style="display:none;">
+      <label id="mLabel">名称</label>
+      <input id="mInput" />
+    </div>
+    <div class="foot">
+      <button id="mCancel" class="ghost">取消</button>
+      <button id="mOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var BASE = location.origin;
+  var S = { device: '', path: '/', entries: [], info: null, token: '', busy: false };
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function log(msg, cls) {
+    var el = $('log');
+    var t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    var line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = '[' + t + '] ' + msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function fmtSize(n) {
+    if (n === null || n === undefined || n === '') return '—';
+    n = Number(n);
+    if (!isFinite(n)) return '—';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(2) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  }
+  function fmtKb(kb) { return (kb === null || kb === undefined || kb === '') ? '—' : fmtSize(Number(kb) * 1024); }
+
+  function fmtTime(sec) {
+    if (!sec) return '—';
+    var d = new Date(Number(sec) * 1000);
+    if (isNaN(d.getTime())) return '—';
+    var p = function (x) { return (x < 10 ? '0' : '') + x; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+      + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function headers(extra) {
+    var h = { 'Authorization': 'Bearer ' + (S.token || 'x') };
+    if (extra) { for (var k in extra) h[k] = extra[k]; }
+    return h;
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var url = BASE + path;
+    var init = { method: opts.method || 'GET', headers: headers(opts.headers) };
+    if (opts.body) init.body = opts.body;
+    return fetch(url, init).then(function (r) {
+      return r.json().catch(function () { return { ok: false, error: { message: 'HTTP ' + r.status } }; })
+        .then(function (j) { return { status: r.status, body: j }; });
+    });
+  }
+
+  function errText(body) {
+    if (!body) return '未知错误';
+    if (body.error && body.error.message) return body.error.message;
+    if (typeof body.error === 'string') return body.error;
+    return body.code || '未知错误';
+  }
+
+  function q(path, params) {
+    var p = [];
+    for (var k in params) {
+      if (params[k] !== undefined && params[k] !== null && params[k] !== '') {
+        p.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+      }
+    }
+    return path + (p.length ? '?' + p.join('&') : '');
+  }
+
+  // ---------------- 弹窗 ----------------
+  var modalCb = null;
+  var modalCancelCb = null;
+  var modalValue = null;
+  function openModal(o) {
+    $('mTitle').textContent = o.title || '确认';
+    $('mText').textContent = o.text || '';
+    if (o.field) {
+      $('mField').style.display = '';
+      $('mLabel').textContent = o.field.label || '名称';
+      $('mInput').value = o.field.value || '';
+      $('mInput').placeholder = o.field.placeholder || '';
+    } else {
+      $('mField').style.display = 'none';
+    }
+    $('mOk').className = o.danger ? 'red' : '';
+    $('mOk').textContent = o.okText || '确定';
+    modalCb = o.onOk;
+    modalCancelCb = o.onCancel;   // 取消/点遮罩/按 Esc 时回调，避免调用方 await 卡住
+    $('mask').classList.add('on');
+    if (o.field) setTimeout(function () { $('mInput').focus(); }, 30);
+  }
+  function closeModal(byOk) {
+    var ok = modalCb, cancel = modalCancelCb, val = modalValue;
+    $('mask').classList.remove('on');
+    modalCb = null;
+    modalCancelCb = null;
+    modalValue = null;
+    if (byOk && ok) ok(val);
+    if (!byOk && cancel) cancel();
+  }
+  $('mCancel').onclick = function () { closeModal(false); };
+  $('mask').onclick = function (e) { if (e.target === $('mask')) closeModal(false); };
+  $('mOk').onclick = function () {
+    var v = $('mField').style.display === 'none' ? null : $('mInput').value.trim();
+    modalValue = v;
+    closeModal(true);
+  };
+  $('mInput').onkeydown = function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); $('mOk').click(); }
+  };
+  // Esc 等同取消：不处理的话，等弹窗结果的调用方会一直挂着
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && $('mask').classList.contains('on')) {
+      e.preventDefault();
+      closeModal(false);
+    }
+  });
+
+  // ---------------- 设备与状态 ----------------
+  function setTag(el, text, cls) {
+    el.textContent = text;
+    el.className = 'tag ' + cls;
+  }
+
+  // 默认挑一台能用的：优先在线的，其中优先确认插了卡的；全离线才退回列表第一台。
+  // 以前直接取 devs[0]，而列表是按 device_id 排的，127.0.0.1 / dog-001 这种
+  // 早就废掉的记录排在最前面 → 一打开就选中一台永远连不上的"设备"。
+  function pickUsable(devs) {
+    var on = devs.filter(function (d) { return d.online; });
+    var pool = on.length ? on : devs;
+    var carded = pool.filter(function (d) { return d.sd_mounted === true; });
+    return (carded[0] || pool[0]).device_id;
+  }
+
+  // 把"会影响展示"的字段压成一个签名，用来判断要不要动 DOM。
+  // 用签名而不是直接重绘：3 秒轮询下无脑重绘会闪，也会打断正在操作的手感。
+  function devSig(devs) {
+    return devs.map(function (d) {
+      return [d.device_id, d.online ? 1 : 0, d.ip || '', d.endpoint || '',
+              d.sd_mounted === true ? 1 : 0, d.ip_mismatch ? 1 : 0].join(',');
+    }).join('|');
+  }
+
+  function renderDevices(devs) {
+    var sel = $('device');
+    sel.innerHTML = devs.map(function (d) {
+      var mark = (d.sd_mounted === true) ? ' [卡]' : '';
+      return '<option value="' + d.device_id + '">' + d.device_id
+        + (d.online ? '' : '（离线）') + mark + '</option>';
+    }).join('');
+    sel.value = S.device;
+    var cur = null;
+    for (var i = 0; i < devs.length; i++) { if (devs[i].device_id === S.device) cur = devs[i]; }
+    var el = $('epInfo');
+    if (!cur) { el.textContent = ''; return; }
+    el.textContent = '端点 ' + (cur.endpoint || '未知')
+      + ' · 板子自报 ' + (cur.ip || '—')
+      + (cur.endpoint_auto === false ? ' · 手动登记' : '');
+    el.style.color = '';
+    if (cur.ip_mismatch) {
+      el.textContent += ' · ⚠ 两者不一致（服务端按"端点"那个地址连板子）';
+      el.style.color = 'var(--bad)';
+    } else if (cur.endpoint_corrected_from) {
+      el.textContent += ' · 已从 ' + cur.endpoint_corrected_from + ' 自动纠偏';
+      el.style.color = 'var(--warn)';
+    }
+  }
+
+  function loadDevices() {
+    return api('/api/v1/sd/devices').then(function (r) {
+      var sel = $('device');
+      var devs = (r.body && r.body.devices) || [];
+      S.devs = devs;
+      S.devSig = devSig(devs);
+      if (!devs.length) {
+        sel.innerHTML = '<option value="">（没有已知设备）</option>';
+        $('epInfo').textContent = '';
+        log('没有已知设备：请先让板子连上音频 WS', 'warn');
+        showBanner('b-bad', '没有已知设备。板子需先连上音频 WS（<code>:8765</code>）完成 hello，'
+          + '服务端才会记录它的 IP。');
+        return;
+      }
+      var keep = S.device;
+      var has = devs.some(function (d) { return d.device_id === keep; });
+      S.device = has ? keep : pickUsable(devs);
+      renderDevices(devs);
+      log('设备列表：' + devs.length + ' 台，选中 ' + S.device);
+    });
+  }
+
+  // 3 秒轮询设备/端点状态。只做两件事：
+  //   ① 签名变了才重绘下拉与端点行（不闪、不动用户正在输入的东西）；
+  //   ② 若选中设备的**地址或在线状态**变了，清掉 banner 并重取 info + 文件列表。
+  // 没有 ② 的话，旧 banner（文字里嵌着旧 IP）会一直挂在那儿，
+  // 看起来就像"页面在乱报板子 IP"—— 这正是之前那个问题的来源。
+  var pollTimer = null;
+  function pollDevices() {
+    return api('/api/v1/sd/devices').then(function (r) {
+      var devs = (r.body && r.body.devices) || [];
+      if (!devs.length) return;
+      var sig = devSig(devs);
+      if (sig === S.devSig) return;
+      var before = null, after = null;
+      (S.devs || []).forEach(function (d) { if (d.device_id === S.device) before = d; });
+      devs.forEach(function (d) { if (d.device_id === S.device) after = d; });
+      S.devs = devs;
+      S.devSig = sig;
+      if (!after) {                       // 选中设备不在列表里了（换 ID / 端点被删）
+        S.device = pickUsable(devs);
+        renderDevices(devs);
+        log('原选中设备已不在列表，改选 ' + S.device, 'warn');
+        boot2();
+        return;
+      }
+      renderDevices(devs);
+      var moved = !before || before.ip !== after.ip || before.endpoint !== after.endpoint
+        || (!!before.online) !== (!!after.online);
+      if (moved) {
+        log('设备地址/在线状态变化：' + ((before && before.endpoint) || '—') + ' → '
+          + (after.endpoint || '—') + (after.online ? '（在线）' : '（离线）'), 'warn');
+        clearBanner();
+        loadInfo().then(function () { return loadList(S.path); });
+      }
+    }).catch(function () { /* 轮询失败静默，下次再来 */ });
+  }
+
+  function startPoll() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollDevices, 3000);
+  }
+
+  function showBanner(cls, html) {
+    var b = $('banner');
+    b.className = 'banner ' + cls;
+    b.style.display = '';
+    b.innerHTML = html;
+  }
+
+  // 清掉提示条。清空后必须隐藏 —— .banner 自带内边距，否则会留一条空色带。
+  // 它的作用：板子换地址时，把嵌着旧 IP 的那句提示真正抹掉，而不是让它继续挂着。
+  function clearBanner() {
+    var b = $('banner');
+    b.className = 'banner';
+    b.innerHTML = '';
+    b.style.display = 'none';
+  }
+
+  function loadInfo() {
+    S.info = null;
+    ['sdMount', 'sdSize', 'sdFree', 'sdMax'].forEach(function (id) { $(id).textContent = '—'; });
+    $('sdMount').className = 'muted';
+    $('sdBarBox').style.display = 'none';
+    if (!S.device) return Promise.resolve();
+    clearBanner();   // 每次探测前先清掉上一条提示（它可能嵌着已经失效的 IP）
+    return api(q('/api/v1/sd/info', { device_id: S.device })).then(function (r) {
+      var b = r.body || {};
+      if (!b.ok) {
+        var code = b.code || (b.error && b.error.code) || '';
+        if (code === 'SD_NOT_SUPPORTED') {
+          setTag($('sdMount'), '固件不支持', 't-warn');
+          showBanner('b-warn', '<b>当前固件不含 SD 接口。</b>板端没有 <code>/api/sd/*</code> 路由，'
+            + '需要刷入带 SD 接口的固件后此页才能使用。');
+        } else if (code === 'BOARD_UNREACHABLE') {
+          setTag($('sdMount'), '连不上', 't-bad');
+          showBanner('b-bad', '连不上板子：' + errText(b));
+        } else if (code === 'BOARD_BAD_RESPONSE') {
+          // 板端把 HTTP 状态行写坏了：正文其实是对的，但协议层解析不过去。
+          setTag($('sdMount'), '响应异常', 't-bad');
+          showBanner('b-bad', '<b>板子回了畸形 HTTP 响应</b>（不是网络不通）：' + errText(b));
+        } else if (code === 'SD_IO_ERROR') {
+          // 卡挂上了但容量读不出来。浏览/上传/删除这些常用接口不受影响。
+          setTag($('sdMount'), '读卡失败', 't-warn');
+          showBanner('b-warn', '<b>卡已挂载，但容量读取失败</b>：' + errText(b)
+            + '。板端 <code>/api/sd/info</code> 的容量查询有问题；'
+            + '文件列表、上传、删除都还可用。');
+        } else {
+          setTag($('sdMount'), code || '失败', 't-bad');
+          showBanner('b-bad', errText(b));
+        }
+        log('读取 SD 状态失败：' + errText(b), 'err');
+        return;
+      }
+      var d = b.data || {};
+      S.info = d;
+      if (d.mounted) { setTag($('sdMount'), '已挂载', 't-ok'); }
+      else { setTag($('sdMount'), '未插卡', 't-warn'); }
+      bannerFromInfo();
+      $('sdSize').textContent = fmtKb(d.total_kb);
+      $('sdFree').textContent = fmtKb(d.free_kb);
+      $('sdMax').textContent = d.max_upload_kb
+        ? fmtKb(d.max_upload_kb) : fmtSize(SD_LIMIT_FALLBACK) + '（默认）';
+      if (d.total_kb && d.free_kb !== undefined) {
+        var pct = Math.max(0, Math.min(100, (d.free_kb / d.total_kb) * 100));
+        $('sdBarBox').style.display = '';
+        $('sdBar').style.width = pct.toFixed(1) + '%';
+        $('sdBar').style.background = pct < 10 ? 'var(--bad)' : (pct < 25 ? 'var(--warn)' : 'var(--accent)');
+      }
+      log('SD 状态：' + (d.mounted ? '已挂载' : '未挂载') + '，剩余 ' + fmtKb(d.free_kb));
+    });
+  }
+
+  function loadDevState() {
+    return api('/api/v1/devices').then(function (r) {
+      var list = (r.body && r.body.devices) || [];
+      var d = null;
+      for (var i = 0; i < list.length; i++) { if (list[i].device_id === S.device) d = list[i]; }
+      if (!d) { setTag($('devState'), '未知', 't-off'); return; }
+      if (d.online) setTag($('devState'), d.state || '在线', 't-ok');
+      else setTag($('devState'), '离线', 't-off');
+    }).catch(function () { setTag($('devState'), '未知', 't-off'); });
+  }
+
+  // ---------------- 文件列表 ----------------
+  function basename(p) { var a = String(p).split('/'); return a[a.length - 1] || '/'; }
+  function dirname(p) {
+    var a = String(p).split('/'); a.pop();
+    var s = a.join('/');
+    return s === '' ? '/' : s;
+  }
+  function joinPath(dir, name) {
+    var d = dir === '/' ? '' : dir.replace(/\/+$/, '');
+    return d + '/' + name;
+  }
+
+  function renderCrumb() {
+    var el = $('crumb');
+    var parts = S.path === '/' ? [] : S.path.split('/').filter(Boolean);
+    var html = '<span class="seg" data-p="/">SD 卡</span>';
+    var acc = '';
+    parts.forEach(function (seg, i) {
+      acc += '/' + seg;
+      html += '<span class="sep">/</span>';
+      html += (i === parts.length - 1)
+        ? '<span class="cur">' + seg + '</span>'
+        : '<span class="seg" data-p="' + acc + '">' + seg + '</span>';
+    });
+    el.innerHTML = html;
+    Array.prototype.forEach.call(el.querySelectorAll('.seg'), function (n) {
+      n.onclick = function () { loadList(n.getAttribute('data-p')); };
+    });
+  }
+
+  var ICON_DIR = '<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="#d97706" stroke-width="1.3">'
+    + '<path d="M1.5 4.2h4l1.2 1.5h7.8v6.6a.8.8 0 0 1-.8.8H2.3a.8.8 0 0 1-.8-.8z"/>'
+    + '<path d="M1.5 4.2V3a.8.8 0 0 1 .8-.8h2.4l1.1 1.3"/></svg>';
+  var ICON_FILE = '<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="#64748b" stroke-width="1.3">'
+    + '<path d="M3.6 1.8h5.2l3.6 3.6v8.8a.8.8 0 0 1-.8.8H3.6a.8.8 0 0 1-.8-.8V2.6a.8.8 0 0 1 .8-.8z"/>'
+    + '<path d="M8.8 1.8v3.6h3.6"/></svg>';
+
+  function renderRows() {
+    var tb = $('tbody');
+    if (!S.entries.length) {
+      tb.innerHTML = '<tr><td colspan="4" class="empty">这个目录是空的</td></tr>';
+      $('countInfo').textContent = '0 项';
+      return;
+    }
+    tb.innerHTML = S.entries.map(function (e, i) {
+      var isDir = e.type === 'dir';
+      var size = isDir ? '—' : fmtSize(e.size);
+      return '<tr>'
+        + '<td><span class="name" data-i="' + i + '">' + (isDir ? ICON_DIR : ICON_FILE)
+        + '<span class="mono">' + escapeHtml(e.name) + '</span></span></td>'
+        + '<td class="muted">' + size + '</td>'
+        + '<td class="muted">' + fmtTime(e.mtime) + '</td>'
+        + '<td class="act">'
+        + (isDir ? '' : '<button class="ghost" data-dl="' + i + '" style="padding:5px 9px;">下载</button> ')
+        + '<button class="ghost" data-rn="' + i + '" style="padding:5px 9px;">改名</button> '
+        + '<button class="red" data-rm="' + i + '" style="padding:5px 9px;">删除</button>'
+        + '</td></tr>';
+    }).join('');
+    $('countInfo').textContent = S.entries.length + ' 项'
+      + (S.truncated ? '（板端上限，可能未列全）' : '');
+    Array.prototype.forEach.call(tb.querySelectorAll('.name'), function (n) {
+      n.onclick = function () { var e = S.entries[+n.getAttribute('data-i')]; openEntry(e); };
+    });
+    Array.prototype.forEach.call(tb.querySelectorAll('[data-dl]'), function (n) {
+      n.onclick = function () { download(S.entries[+n.getAttribute('data-dl')]); };
+    });
+    Array.prototype.forEach.call(tb.querySelectorAll('[data-rn]'), function (n) {
+      n.onclick = function () { askRename(S.entries[+n.getAttribute('data-rn')]); };
+    });
+    Array.prototype.forEach.call(tb.querySelectorAll('[data-rm]'), function (n) {
+      n.onclick = function () { askDelete(S.entries[+n.getAttribute('data-rm')]); };
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function openEntry(e) {
+    if (e.type === 'dir') { loadList(joinPath(S.path, e.name)); }
+    else { log('这是文件，点右侧「下载」取回：' + e.name); }
+  }
+
+  function loadList(path) {
+    if (!S.device) return Promise.resolve();
+    $('tbody').innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
+    return api(q('/api/v1/sd/list', { device_id: S.device, path: path })).then(function (r) {
+      var b = r.body || {};
+      if (!b.ok) {
+        var code = b.code || '';
+        listErrorBanner(code, b);
+        S.entries = [];
+        renderRows();
+        return;
+      }
+      var d = b.data || {};
+      S.path = b.path || d.path || path;
+      S.entries = (d.entries || []).slice().sort(function (x, y) {
+        if ((x.type === 'dir') !== (y.type === 'dir')) return x.type === 'dir' ? -1 : 1;
+        return String(x.name).localeCompare(String(y.name));
+      });
+      S.truncated = !!d.truncated;
+      renderCrumb();
+      renderRows();
+      $('btnUp').disabled = (S.path === '/');
+      log('已列出 ' + S.path + '：' + S.entries.length + ' 项' + (S.truncated ? '（已截断）' : ''));
+      if (S.truncated) {
+        showBanner('b-warn', '目录项超过板端单次上限（64），只显示了部分内容。');
+      } else {
+        bannerFromInfo();
+      }
+    });
+  }
+
+  function bannerFromInfo() {
+    var d = S.info;
+    if (!d) return;
+    if (d.mounted) {
+      showBanner('b-ok', 'SD 卡已挂载于 <code>' + (d.mount_point || '/sdcard') + '</code>'
+        + (d.card ? '（' + d.card + '）' : '') + '，可以浏览与修改文件。');
+    } else {
+      showBanner('b-warn', '<b>该设备未插 SD 卡</b>（或挂载失败）。'
+        + '板子不会自动格式化卡片，请格式化为 FAT32 后重新上电。');
+    }
+  }
+
+  function listErrorBanner(code, b) {
+    if (code === 'SD_NOT_MOUNTED') {
+      showBanner('b-warn', '<b>该设备未插 SD 卡</b>（或挂载失败），无法列出文件。');
+    } else if (code === 'SD_NOT_SUPPORTED') {
+      showBanner('b-warn', '<b>当前固件不含 SD 接口</b>：板端缺 <code>/api/sd/list</code> 路由。');
+    } else if (code === 'SD_NOT_FOUND') {
+      showBanner('b-warn', '路径不存在：' + errText(b) + '（已退回根目录）');
+      return loadList('/');
+    } else {
+      showBanner('b-bad', errText(b));
+    }
+    log('列目录失败：' + errText(b), 'err');
+  }
+
+  // ---------------- 操作 ----------------
+  function download(e) {
+    var rel = joinPath(S.path, e.name);
+    log('开始下载 ' + rel + '…');
+    fetch(BASE + q('/api/v1/sd/download', { device_id: S.device, path: rel }), { headers: headers() })
+      .then(function (resp) {
+        if (!resp.ok) {
+          return resp.json().catch(function () { return null; }).then(function (b) {
+            log('下载失败：' + errText(b) + '（HTTP ' + resp.status + '）', 'err');
+            showBanner('b-bad', '下载失败：' + errText(b));
+          });
+        }
+        return resp.blob().then(function (blob) {
+          var a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = e.name;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+          log('已取回 ' + e.name + '（' + fmtSize(blob.size) + '）', 'ok');
+        });
+      })
+      .catch(function (err) { log('下载异常：' + err, 'err'); });
+  }
+
+  function askMkdir() {
+    openModal({
+      title: '新建文件夹',
+      text: '在 ' + S.path + ' 下创建一个目录。',
+      field: { label: '目录名（英文数字与 . _ -）', placeholder: 'voice', value: '' },
+      okText: '创建',
+      onOk: function (name) {
+        if (!name) return;
+        api(q('/api/v1/sd/mkdir', { device_id: S.device, path: joinPath(S.path, name) }),
+          { method: 'POST' }).then(function (r) {
+            if (r.body && r.body.ok) { log('已创建 ' + joinPath(S.path, name), 'ok'); loadList(S.path); }
+            else { log('新建失败：' + errText(r.body), 'err'); }
+          });
+      }
+    });
+  }
+
+  function askRename(e) {
+    var rel = joinPath(S.path, e.name);
+    openModal({
+      title: '重命名',
+      text: '当前：' + rel,
+      field: { label: '新名称', value: e.name },
+      okText: '改名',
+      onOk: function (name) {
+        if (!name || name === e.name) return;
+        api(q('/api/v1/sd/rename', { device_id: S.device, from: rel, to: joinPath(S.path, name) }),
+          { method: 'POST' }).then(function (r) {
+            if (r.body && r.body.ok) { log('已改名为 ' + name, 'ok'); loadList(S.path); }
+            else { log('改名失败：' + errText(r.body), 'err'); }
+          });
+      }
+    });
+  }
+
+  function askDelete(e) {
+    var rel = joinPath(S.path, e.name);
+    var what = e.type === 'dir' ? '目录（必须为空）' : '文件';
+    openModal({
+      title: '删除' + (e.type === 'dir' ? '目录' : '文件'),
+      text: '确认删除这个' + what + '？\n' + rel + '\n此操作不可撤销。',
+      okText: '删除',
+      danger: true,
+      onOk: function () {
+        api(q('/api/v1/sd/delete', { device_id: S.device, path: rel }), { method: 'POST' })
+          .then(function (r) {
+            if (r.body && r.body.ok) { log('已删除 ' + rel, 'ok'); loadList(S.path); }
+            else { log('删除失败：' + errText(r.body), 'err'); }
+          });
+      }
+    });
+  }
+
+  // ---------------- 上传（重名校验以服务端为准）----------------
+  var SD_LIMIT_FALLBACK = 256 * 1024 * 1024;   // 与服务端 SD_MAX_UPLOAD_FALLBACK 保持一致
+
+  function sdLimitBytes() {
+    var kb = S.info && S.info.max_upload_kb;
+    return kb ? Number(kb) * 1024 : SD_LIMIT_FALLBACK;
+  }
+
+  function statPath(rel) {
+    return api(q('/api/v1/sd/stat', { device_id: S.device, path: rel }));
+  }
+
+  // 重名提示由服务端的应答触发（服务端才是权威判定），确认覆盖才带 overwrite=1 重传
+  function askOverwrite(file, dir, body) {
+    return new Promise(function (resolve) {
+      // 两种来源要都认：预检 /api/v1/sd/stat 把字段放在顶层（exists/type/size），
+      // 上传被 409 拦下时放在 existing 里（certain/existing）。归一化一次，别让调用方各写一套。
+      var b = body || {};
+      var ex = b.existing || (b.exists ? { type: b.type, size: b.size } : null);
+      var text;
+      if (ex) {
+        text = '目标位置已存在同名' + (ex.type === 'dir' ? '目录' : '文件')
+          + '（' + fmtSize(ex.size) + '）：\n' + joinPath(dir, file.name)
+          + '\n\n继续上传会整体覆盖它，原内容不可恢复。';
+      } else {
+        text = '向板子确认目标是否已存在时没有得到答复：\n'
+          + errText(body)
+          + '\n\n继续上传可能覆盖同名文件：\n' + joinPath(dir, file.name);
+      }
+      openModal({
+        title: '已存在同名文件',
+        text: text,
+        okText: '覆盖上传',
+        danger: true,
+        onOk: function () { resolve(true); },
+        onCancel: function () { resolve(false); }
+      });
+    });
+  }
+
+  function uploadOneRaw(file, dir, overwrite) {
+    return new Promise(function (resolve) {
+      var rel = joinPath(dir, file.name);
+      var url = BASE + q('/api/v1/sd/upload',
+        { device_id: S.device, path: rel, overwrite: overwrite ? '1' : '' });
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.setRequestHeader('Authorization', 'Bearer ' + (S.token || 'x'));
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      $('upbox').style.display = '';
+      $('upName').textContent = file.name;
+      $('upText').textContent = '0%';
+      $('upBar').style.width = '0%';
+      $('upBar').style.background = 'var(--accent)';
+      xhr.upload.onprogress = function (ev) {
+        if (ev.lengthComputable) {
+          var pct = (ev.loaded / ev.total) * 100;
+          $('upBar').style.width = pct.toFixed(1) + '%';
+          $('upText').textContent = pct.toFixed(0) + '%  ' + fmtSize(ev.loaded) + ' / ' + fmtSize(ev.total);
+        }
+      };
+      xhr.onload = function () {
+        var b = null;
+        try { b = JSON.parse(xhr.responseText); } catch (e) { b = null; }
+        resolve({ ok: xhr.status >= 200 && xhr.status < 300 && !!b && b.ok,
+                  status: xhr.status, body: b });
+      };
+      xhr.onerror = function () { resolve({ ok: false, status: 0, body: null, net: true }); };
+      xhr.onabort = function () { resolve({ ok: false, status: 0, body: null, net: true }); };
+      xhr.send(file);
+    });
+  }
+
+  function markFail(txt) {
+    $('upBar').style.background = 'var(--bad)';
+    $('upText').textContent = txt;
+  }
+
+  function doUpload(file, dir, overwrite) {
+    return uploadOneRaw(file, dir, overwrite).then(function (res) {
+      if (res.ok) {
+        log('已上传 ' + file.name + '（' + fmtSize(file.size) + '）', 'ok');
+        $('upBar').style.width = '100%';
+        $('upText').textContent = '完成';
+        return;
+      }
+      // 服务端在读 body 之前就拦下同名文件 —— 预检之后被人抢先创建时会走到这里
+      if (res.status === 409 && res.body && res.body.code === 'SD_EXISTS') {
+        return askOverwrite(file, dir, res.body).then(function (yes) {
+          if (!yes) { log('已跳过 ' + file.name + '（未覆盖）', 'warn'); return; }
+          return doUpload(file, dir, true);
+        });
+      }
+      if (res.net) {
+        // 服务端提前回绝并关了连接时，浏览器只看到网络错误 —— 回查一次再判定
+        return statPath(joinPath(dir, file.name)).then(function (r) {
+          var b = r.body || {};
+          if (r.status === 200 && b.exists) {
+            return askOverwrite(file, dir, b).then(function (yes) {
+              if (!yes) { markFail('已取消'); log('已跳过 ' + file.name + '（未覆盖）', 'warn'); return; }
+              return doUpload(file, dir, true);
+            });
+          }
+          markFail('网络错误');
+          log('上传异常 ' + file.name + '：与服务端的连接中断', 'err');
+        });
+      }
+      markFail('失败');
+      log('上传失败 ' + file.name + '：' + errText(res.body) + '（HTTP ' + res.status + '）', 'err');
+    });
+  }
+
+  function uploadOne(file, dir) {
+    var limit = sdLimitBytes();
+    if (file.size > limit) {
+      log('跳过 ' + file.name + '：' + fmtSize(file.size) + ' 超过单文件上限 ' + fmtSize(limit), 'err');
+      return Promise.resolve();
+    }
+    return statPath(joinPath(dir, file.name)).then(function (r) {
+      var b = r.body || {};
+      if (r.status === 200 && b.exists) {
+        return askOverwrite(file, dir, b).then(function (yes) {
+          if (!yes) { log('已跳过 ' + file.name + '（未覆盖）', 'warn'); return; }
+          return doUpload(file, dir, true);
+        });
+      }
+      return doUpload(file, dir, false);
+    });
+  }
+
+  function uploadFiles(files) {
+    if (!files || !files.length || !S.device) return;
+    var dir = S.path;
+    var chain = Promise.resolve();
+    Array.prototype.forEach.call(files, function (f) {
+      chain = chain.then(function () { return uploadOne(f, dir); });
+    });
+    chain.then(function () {
+      setTimeout(function () { $('upbox').style.display = 'none'; }, 1200);
+      loadList(dir);
+      loadInfo();
+    });
+  }
+
+  // ---------------- 初始化 ----------------
+  $('btnRefresh').onclick = function () { loadInfo().then(function () { return loadList(S.path); }); };
+  $('btnUp').onclick = function () { if (S.path !== '/') loadList(dirname(S.path)); };
+  $('btnMkdir').onclick = askMkdir;
+  $('btnPick').onclick = function () { $('fileInput').click(); };
+  $('fileInput').onchange = function (e) { uploadFiles(e.target.files); e.target.value = ''; };
+  $('btnReload').onclick = function () { boot(); };
+  $('device').onchange = function () {
+    S.device = $('device').value;
+    S.path = '/';
+    boot2();
+  };
+  $('btnSaveToken').onclick = function () {
+    S.token = $('token').value.trim();
+    try { localStorage.setItem('dog_sd_token', S.token); } catch (e) { /* 忽略 */ }
+    log('已记住 Token（仅存本地浏览器）', 'ok');
+    boot2();
+  };
+
+  function boot2() {
+    return loadDevState()
+      .then(loadInfo)
+      .then(function () { return loadList('/'); });
+  }
+
+  function boot() {
+    S.token = $('token').value.trim() || 'x';
+    $('base').textContent = BASE;
+    log('控制台就绪 · ' + BASE);
+    startPoll();   // 设备地址/在线状态 3 秒轮询，避免页面一直挂着失效的 IP
+    loadDevices().then(boot2);
+  }
+
+  try {
+    var t = localStorage.getItem('dog_sd_token');
+    if (t) $('token').value = t;
+  } catch (e) { /* 忽略 */ }
+  boot();
+})();
+</script>
+</body>
+</html>
